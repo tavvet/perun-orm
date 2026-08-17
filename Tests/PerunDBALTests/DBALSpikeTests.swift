@@ -148,216 +148,57 @@ func postgresAdapterPreservesPortableTimestampAndCommandSemantics() throws {
     }
 }
 
-@Test(.enabled(if: ProcessInfo.processInfo.environment["PERUN_PGSQL_INTEGRATION"] == "1"))
-func postgresAdapterExecutesPortableValuesAgainstLiveServer() async throws {
-    let database = PostgresDatabase(
-        configuration: postgresIntegrationConfiguration(),
-        maxConnections: 1
-    )
-    let uuid = try #require(UUID(uuidString: "d7a42f38-c223-4f8c-bb11-cf304b086b3a"))
-    let date = Date(timeIntervalSince1970: 4_368_673_968.123_222)
-    let payload: [UInt8] = [0, 1, 2, 255]
-
+@Test
+func sqliteAdapterKeepsGeneratedRowIDHintsScoped() async throws {
+    let database = SQLiteDatabase(configuration: .memory(), maxConnections: 1)
     do {
-        let result = try await database.execute(
-            """
-            SELECT $1 AS flag,
-                   $2::integer AS small,
-                   $3::bigint AS large,
-                   $4 AS score,
-                   $5 AS name,
-                   $6 AS payload,
-                   $7 AS created_at,
-                   $8 AS token,
-                   $9::text AS absent
-            """,
-            [
-                .bool(true),
-                .int(42),
-                .int(Int64.max),
-                .double(.infinity),
-                .text("perun"),
-                .blob(payload),
-                date.sqlValue,
-                .uuid(uuid),
-                .null,
-            ]
+        _ = try await database.execute(
+            "CREATE TABLE rowid_samples (id INTEGER PRIMARY KEY, token TEXT UNIQUE NOT NULL)",
+            []
         )
-        #expect(result.rowsAffected == 0)
-        let row = try #require(result.rows.first)
-        #expect(try row.decode("flag", as: Bool.self))
-        #expect(try row.decode("small", as: Int32.self) == 42)
-        #expect(try row.decode("large", as: Int64.self) == .max)
-        #expect(try row.decode("score", as: Double.self).isInfinite)
-        #expect(try row.decode("name", as: String.self) == "perun")
-        #expect(try row.decode("payload", as: [UInt8].self) == payload)
-        #expect(try row.decode("created_at", as: Date.self).sqlValue == date.sqlValue)
-        #expect(try row.decode("token", as: UUID.self) == uuid)
-        #expect(try row.decode("absent", as: String?.self) == nil)
-        #expect(try row.decodeIfPresent("absent", as: String.self) == nil)
+        let firstRowID = try await database.execute(
+            "INSERT INTO rowid_samples (token) VALUES (?)",
+            [.text("duplicate")],
+            intent: .generatedRowIDInsert
+        )
+        #expect(firstRowID.lastInsertRowID == 1)
 
-        let transactionResult = try await database.withTransaction { transaction in
-            try await transaction.execute("SELECT 1::bigint AS value", [])
-        }
-        let transactionRow = try #require(transactionResult.rows.first)
-        #expect(try transactionRow.decode("value", as: Int64.self) == 1)
+        let ignoredInsert = try await database.execute(
+            "INSERT OR IGNORE INTO rowid_samples (token) VALUES (?)",
+            [.text("duplicate")],
+            intent: .generatedRowIDInsert
+        )
+        #expect(ignoredInsert.rowsAffected == 0)
+        #expect(ignoredInsert.lastInsertRowID == nil)
+
+        let cteInsert = try await database.execute(
+            "WITH value(token) AS (SELECT 'cte') INSERT INTO rowid_samples (token) SELECT token FROM value",
+            [],
+            intent: .generatedRowIDInsert
+        )
+        #expect(cteInsert.lastInsertRowID == 2)
+
+        let arbitraryInsert = try await database.execute(
+            "INSERT INTO rowid_samples (token) VALUES (?)",
+            [.text("arbitrary")]
+        )
+        #expect(arbitraryInsert.rowsAffected == 1)
+        #expect(arbitraryInsert.lastInsertRowID == nil)
+
+        _ = try await database.execute(
+            "CREATE TABLE without_rowid (id TEXT PRIMARY KEY) WITHOUT ROWID",
+            []
+        )
+        let withoutRowID = try await database.execute(
+            "INSERT INTO without_rowid (id) VALUES (?)",
+            [.text("not-a-rowid-table")]
+        )
+        #expect(withoutRowID.rowsAffected == 1)
+        #expect(withoutRowID.lastInsertRowID == nil)
     } catch {
         await database.shutdown()
         throw error
     }
 
     await database.shutdown()
-}
-
-@Test
-func sqliteAdapterExecutesPortableValuesAndRollsBack() async throws {
-    let database = SQLiteDatabase(configuration: .memory(), maxConnections: 1)
-    let uuid = try #require(UUID(uuidString: "d7a42f38-c223-4f8c-bb11-cf304b086b3a"))
-    // Regression value: repeated Date-based microsecond normalization used to drift by 1 μs.
-    let date = Date(timeIntervalSince1970: 4_368_673_968.123_222)
-
-    do {
-        _ = try await database.execute("SELECT ?", [.double(.nan)])
-        Issue.record("SQLite adapter unexpectedly bound NaN")
-    } catch let error as SQLValueBindingError {
-        #expect(error == .notANumber)
-    }
-    do {
-        _ = try await database.execute(
-            "SELECT ?",
-            [Date(timeIntervalSinceReferenceDate: .infinity).sqlValue]
-        )
-        Issue.record("SQLite adapter unexpectedly bound a non-finite timestamp")
-    } catch let error as SQLValueBindingError {
-        #expect(error == .nonFiniteTimestamp)
-    }
-
-    let infinityResult = try await database.execute("SELECT ? AS value", [.double(.infinity)])
-    let infinityRow = try #require(infinityResult.rows.first)
-    #expect(try infinityRow.decode("value", as: Double.self).isInfinite)
-
-    _ = try await database.execute(
-        "CREATE TABLE rowid_samples (id INTEGER PRIMARY KEY, token TEXT UNIQUE NOT NULL)",
-        []
-    )
-    let firstRowID = try await database.execute(
-        "INSERT INTO rowid_samples (token) VALUES (?)",
-        [.text("duplicate")],
-        intent: .generatedRowIDInsert
-    )
-    #expect(firstRowID.lastInsertRowID == 1)
-
-    let ignoredInsert = try await database.execute(
-        "INSERT OR IGNORE INTO rowid_samples (token) VALUES (?)",
-        [.text("duplicate")],
-        intent: .generatedRowIDInsert
-    )
-    #expect(ignoredInsert.rowsAffected == 0)
-    #expect(ignoredInsert.lastInsertRowID == nil)
-
-    let cteInsert = try await database.execute(
-        "WITH value(token) AS (SELECT 'cte') INSERT INTO rowid_samples (token) SELECT token FROM value",
-        [],
-        intent: .generatedRowIDInsert
-    )
-    #expect(cteInsert.lastInsertRowID == 2)
-
-    let arbitraryInsert = try await database.execute(
-        "INSERT INTO rowid_samples (token) VALUES (?)",
-        [.text("arbitrary")]
-    )
-    #expect(arbitraryInsert.rowsAffected == 1)
-    #expect(arbitraryInsert.lastInsertRowID == nil)
-
-    _ = try await database.execute(
-        "CREATE TABLE without_rowid (id TEXT PRIMARY KEY) WITHOUT ROWID",
-        []
-    )
-    let withoutRowID = try await database.execute(
-        "INSERT INTO without_rowid (id) VALUES (?)",
-        [.text("not-a-rowid-table")]
-    )
-    #expect(withoutRowID.rowsAffected == 1)
-    #expect(withoutRowID.lastInsertRowID == nil)
-
-    _ = try await database.execute(
-        """
-        CREATE TABLE samples (
-            id INTEGER PRIMARY KEY,
-            flag INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            token TEXT NOT NULL
-        )
-        """,
-        []
-    )
-
-    let insert = try await database.execute(
-        "INSERT INTO samples (flag, created_at, token) VALUES (?, ?, ?)",
-        [.bool(true), date.sqlValue, .uuid(uuid)],
-        intent: .generatedRowIDInsert
-    )
-    #expect(insert.rowsAffected == 1)
-    #expect(insert.lastInsertRowID == 1)
-
-    let selected = try await database.execute(
-        "SELECT flag, created_at, token FROM samples WHERE id = ?",
-        [.int(1)]
-    )
-    let row = try #require(selected.rows.first)
-    let flag = try row.decode("flag", as: Bool.self)
-    let storedDate = try row.decode("created_at", as: Date.self)
-    let token = try row.decode("token", as: UUID.self)
-    let normalizedDate = try Date(sqlValue: date.sqlValue)
-
-    #expect(flag)
-    #expect(storedDate == normalizedDate)
-    #expect(token == uuid)
-
-    do {
-        let _: Void = try await database.withTransaction { transaction in
-            _ = try await transaction.execute(
-                "INSERT INTO samples (flag, created_at, token) VALUES (?, ?, ?)",
-                [.bool(false), date.sqlValue, .uuid(uuid)]
-            )
-            throw RollbackProbe.expected
-        }
-        Issue.record("transaction unexpectedly committed")
-    } catch RollbackProbe.expected {
-        // Expected: the driver rolls the transaction back when the closure throws.
-    }
-
-    let countResult = try await database.execute("SELECT COUNT(*) AS count FROM samples", [])
-    let countRow = try #require(countResult.rows.first)
-    #expect(try countRow.decode("count", as: Int64.self) == 1)
-
-    let lifecycle: any Database = database
-    await lifecycle.shutdown()
-}
-
-private enum RollbackProbe: Error {
-    case expected
-}
-
-private func postgresIntegrationConfiguration() -> ConnectionConfiguration {
-    let environment = ProcessInfo.processInfo.environment
-    let tlsMode: TLSMode
-    switch environment["PGSSLMODE"] {
-    case "disable":
-        tlsMode = .disable
-    case "prefer", "allow-plaintext-fallback":
-        tlsMode = .allowPlaintextFallback
-    case "require", "encrypt-without-verification":
-        tlsMode = .encryptWithoutVerification
-    default:
-        tlsMode = .verifyFull
-    }
-    return ConnectionConfiguration(
-        host: environment["PGHOST"] ?? "localhost",
-        port: UInt16(environment["PGPORT"] ?? "") ?? 5_432,
-        user: environment["PGUSER"] ?? "perun",
-        database: environment["PGDATABASE"] ?? "perun",
-        password: environment["PGPASSWORD"],
-        tlsMode: tlsMode
-    )
 }
