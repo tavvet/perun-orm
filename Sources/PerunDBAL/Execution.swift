@@ -77,16 +77,82 @@ public struct DialectCapabilities: OptionSet, Sendable, Hashable {
     public static let nativeUUID = Self(rawValue: 1 << 4)
 }
 
+/// SELECT facts that can affect a backend's pagination grammar.
+public struct SQLPaginationContext: Sendable, Hashable {
+    public let hasOrderings: Bool
+
+    public init(hasOrderings: Bool) {
+        self.hasOrderings = hasOrderings
+    }
+}
+
+/// Where a dialect's pagination clause belongs in a SELECT statement.
+public enum SQLPaginationPlacement: Sendable, Hashable {
+    /// Immediately after `SELECT`, for grammars such as `TOP (...)`.
+    case afterSelect
+    /// After predicates and ordering, for grammars such as `LIMIT` or `OFFSET ... FETCH`.
+    case suffix
+}
+
+/// One lexical fragment of a pagination clause.
+public enum SQLPaginationFragment: Sendable, Hashable {
+    /// Backend-owned SQL emitted verbatim.
+    case literal(String)
+    /// An integer emitted as a bound placeholder at this exact lexical position.
+    case parameter(Int)
+}
+
+/// A backend-specific pagination clause that the renderer emits at its lexical position.
+public struct SQLPaginationPlan: Sendable, Hashable {
+    public let placement: SQLPaginationPlacement
+    public let fragments: [SQLPaginationFragment]
+
+    public init(
+        placement: SQLPaginationPlacement,
+        fragments: [SQLPaginationFragment]
+    ) {
+        self.placement = placement
+        self.fragments = fragments
+    }
+}
+
 /// The rendering policy supplied by a concrete backend adapter.
 public protocol SQLDialect: Sendable {
     var capabilities: DialectCapabilities { get }
 
     func placeholder(at position: Int) -> String
     func quoteIdentifier(_ identifier: String) -> String
+    func paginationPlan(
+        limit: Int,
+        offset: Int?,
+        context: SQLPaginationContext
+    ) throws -> SQLPaginationPlan
 }
 
 public extension SQLDialect {
     func quoteIdentifier(_ identifier: String) -> String {
         "\"" + identifier.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    }
+
+    /// SQL-standard default. Dialects whose grammar or validation differs override this method.
+    func paginationPlan(
+        limit: Int,
+        offset: Int?,
+        context: SQLPaginationContext
+    ) throws -> SQLPaginationPlan {
+        var fragments: [SQLPaginationFragment] = []
+        if let offset {
+            fragments.append(contentsOf: [
+                .literal("OFFSET "),
+                .parameter(offset),
+                .literal(" ROWS "),
+            ])
+        }
+        fragments.append(contentsOf: [
+            .literal("FETCH FIRST "),
+            .parameter(limit),
+            .literal(" ROWS ONLY"),
+        ])
+        return SQLPaginationPlan(placement: .suffix, fragments: fragments)
     }
 }

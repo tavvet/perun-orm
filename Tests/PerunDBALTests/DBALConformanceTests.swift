@@ -44,6 +44,7 @@ private func runSharedDBALConformance(
         try await assertPortableRoundTrip(
             database: database,
             dialect: dialect,
+            tableName: tableName,
             table: table,
             columns: columns
         )
@@ -90,6 +91,7 @@ private func assertPortableBindingErrors(
 private func assertPortableRoundTrip(
     database: any Database,
     dialect: any SQLDialect,
+    tableName: String,
     table: String,
     columns: DBALConformanceColumns
 ) async throws {
@@ -109,10 +111,20 @@ private func assertPortableRoundTrip(
     #expect(insert.rows.isEmpty)
     #expect(insert.lastInsertRowID == nil)
 
-    let selected = try await database.execute(
-        "SELECT \(columns.list) FROM \(table) WHERE \(columns.id) = \(dialect.placeholder(at: 1))",
-        [.int(values.id)]
+    let renderedSelect = try SQLRenderer(dialect: dialect).render(
+        SQLSelect(
+            table: tableName,
+            columns: columns.names,
+            predicate: .and([
+                .comparison(column: "id", op: .eq, value: .int(values.id)),
+                .inList(column: "name", values: [.text(values.name), .null]),
+            ]),
+            orderings: [SQLOrdering(column: "id", direction: .descending)],
+            limit: 1,
+            offset: 0
+        )
     )
+    let selected = try await database.execute(renderedSelect.sql, renderedSelect.parameters)
     #expect(selected.rowsAffected == 0)
     #expect(selected.rows.count == 1)
 
@@ -315,6 +327,10 @@ private struct DBALConformanceColumns: Sendable {
     var list: String {
         [id, flag, small, large, score, name, payload, createdAt, token, absent]
             .joined(separator: ", ")
+    }
+
+    var names: [String] {
+        ["id", "flag", "small", "large", "score", "name", "payload", "created_at", "token", "absent"]
     }
 
     var count: Int { 10 }

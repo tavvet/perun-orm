@@ -14,6 +14,24 @@ public struct SQLiteDialect: SQLDialect {
         precondition(position > 0, "placeholder positions are one-based")
         return "?"
     }
+
+    public func paginationPlan(
+        limit: Int,
+        offset: Int?,
+        context: SQLPaginationContext
+    ) -> SQLPaginationPlan {
+        var fragments: [SQLPaginationFragment] = [
+            .literal("LIMIT "),
+            .parameter(limit),
+        ]
+        if let offset {
+            fragments.append(contentsOf: [
+                .literal(" OFFSET "),
+                .parameter(offset),
+            ])
+        }
+        return SQLPaginationPlan(placement: .suffix, fragments: fragments)
+    }
 }
 
 public enum SQLiteAdapterError: Error, Sendable, Equatable {
