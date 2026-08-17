@@ -13,13 +13,23 @@ let package = Package(
         .library(name: "PerunORM", targets: ["PerunORM"]),
     ],
     dependencies: [
-        .package(path: "../perun-sqlite"),
+        .package(
+            url: "https://github.com/tavvet/perun-pgsql.git",
+            .upToNextMinor(from: "0.3.0")
+        ),
+        .package(
+            url: "https://github.com/tavvet/perun-sqlite.git",
+            .upToNextMinor(from: "0.2.0")
+        ),
     ],
     targets: [
         .target(name: "PerunDBAL"),
         .target(
             name: "PerunDBALPostgres",
-            dependencies: ["PerunDBAL"]
+            dependencies: [
+                "PerunDBAL",
+                .product(name: "PerunPGSQL", package: "perun-pgsql"),
+            ]
         ),
         .target(
             name: "PerunDBALSQLite",
@@ -38,6 +48,7 @@ let package = Package(
                 "PerunDBAL",
                 "PerunDBALPostgres",
                 "PerunDBALSQLite",
+                .product(name: "PerunPGSQL", package: "perun-pgsql"),
                 .product(name: "PerunSQLite", package: "perun-sqlite"),
             ]
         ),
