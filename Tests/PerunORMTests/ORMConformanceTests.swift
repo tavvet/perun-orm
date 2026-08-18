@@ -41,6 +41,23 @@ func postgresPassesSharedORMInsertConformance() async throws {
     )
 }
 
+@Test
+func sqlitePassesSharedORMUpdateConformance() async throws {
+    try await runSharedORMUpdateConformance(
+        database: SQLiteDatabase(configuration: .memory(), maxConnections: 1)
+    )
+}
+
+@Test(.enabled(if: ProcessInfo.processInfo.environment["PERUN_PGSQL_INTEGRATION"] == "1"))
+func postgresPassesSharedORMUpdateConformance() async throws {
+    try await runSharedORMUpdateConformance(
+        database: PostgresDatabase(
+            configuration: ormPostgresIntegrationConfiguration(),
+            maxConnections: 1
+        )
+    )
+}
+
 private func runSharedORMFindConformance(database: any Database) async throws {
     let dialect = database.dialect
     let renderer = SQLRenderer(dialect: dialect)
@@ -222,6 +239,94 @@ private func runSharedORMInsertConformance(database: any Database) async throws 
     await database.shutdown()
 }
 
+private func runSharedORMUpdateConformance(database: any Database) async throws {
+    let dialect = database.dialect
+    let renderer = SQLRenderer(dialect: dialect)
+    let tableName = ORMUpdateRecord.tableName
+    let table = dialect.quoteIdentifier(tableName)
+    let dropSQL = "DROP TABLE IF EXISTS \(table)"
+
+    do {
+        _ = try await database.execute(dropSQL, [])
+
+        let schema = try EntitySchema(ORMUpdateRecord.self)
+        let createTable = try renderer.render(schema.createTableStatement)
+        _ = try await database.execute(createTable.sql, createTable.parameters)
+
+        let before = ORMUpdateRecord(
+            id: 42,
+            name: "before",
+            nickname: nil,
+            isActive: true
+        )
+        let insert = try renderer.render(
+            SQLInsert(
+                table: tableName,
+                values: [
+                    SQLColumnValue(column: "id", value: .int(before.id)),
+                    SQLColumnValue(column: "name", value: .text(before.name)),
+                    SQLColumnValue(column: "nickname", value: .null),
+                    SQLColumnValue(column: "is_active", value: .bool(before.isActive)),
+                ]
+            )
+        )
+        let insertResult = try await database.execute(insert.sql, insert.parameters)
+        #expect(insertResult.rowsAffected == 1)
+
+        let session = Session(database: database)
+        let managedBefore = try #require(
+            await session.find(ORMUpdateRecord.self, before.id)
+        )
+        #expect(managedBefore == before)
+
+        let committed = ORMUpdateRecord(
+            id: before.id,
+            name: "committed",
+            nickname: "Perun",
+            isActive: false
+        )
+        let updated = try await session.withUnitOfWork { unitOfWork in
+            let updated = try await unitOfWork.update(committed, from: managedBefore)
+            #expect(updated == committed)
+            #expect(try await unitOfWork.find(ORMUpdateRecord.self, before.id) == committed)
+            #expect(try await unitOfWork.update(committed, from: updated) == committed)
+            return updated
+        }
+        #expect(updated == committed)
+        #expect(try await session.find(ORMUpdateRecord.self, before.id) == committed)
+
+        do {
+            let _: Void = try await session.withUnitOfWork { unitOfWork in
+                _ = try await unitOfWork.update(
+                    ORMUpdateRecord(
+                        id: before.id,
+                        name: "rolled-back",
+                        nickname: nil,
+                        isActive: true
+                    ),
+                    from: updated
+                )
+                throw ORMUpdateConformanceError.rollback
+            }
+            Issue.record("failing update unit of work unexpectedly committed")
+        } catch let error as ORMUpdateConformanceError {
+            #expect(error == .rollback)
+        }
+
+        #expect(try await session.find(ORMUpdateRecord.self, before.id) == committed)
+        let freshSession = Session(database: database)
+        #expect(try await freshSession.find(ORMUpdateRecord.self, before.id) == committed)
+
+        _ = try await database.execute(dropSQL, [])
+    } catch {
+        _ = try? await database.execute(dropSQL, [])
+        await database.shutdown()
+        throw error
+    }
+
+    await database.shutdown()
+}
+
 private struct ORMFindRecord: Entity, Equatable {
     typealias PK = Int64
 
@@ -298,6 +403,44 @@ private struct ORMInsertRecord: Entity, Equatable {
     }
 }
 
+private struct ORMUpdateRecord: Entity, Equatable {
+    typealias PK = Int64
+
+    let id: Int64
+    let name: String
+    let nickname: String?
+    let isActive: Bool
+
+    static let tableName = "perun_orm_update_"
+        + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+    static var fields: [FieldDescriptor<ORMUpdateRecord>] {
+        [
+            FieldDescriptor(
+                \ORMUpdateRecord.id,
+                column: "id",
+                role: .primaryKey(generated: false)
+            ),
+            FieldDescriptor(\ORMUpdateRecord.name, column: "name"),
+            FieldDescriptor(\ORMUpdateRecord.nickname, column: "nickname"),
+            FieldDescriptor(\ORMUpdateRecord.isActive, column: "is_active"),
+        ]
+    }
+
+    init(id: Int64, name: String, nickname: String?, isActive: Bool) {
+        self.id = id
+        self.name = name
+        self.nickname = nickname
+        self.isActive = isActive
+    }
+
+    init(row: any Row) throws {
+        id = try row.decode("id", as: Int64.self)
+        name = try row.decode("name", as: String.self)
+        nickname = try row.decode("nickname", as: String?.self)
+        isActive = try row.decode("is_active", as: Bool.self)
+    }
+}
+
 private actor ORMGeneratedIDBox {
     private(set) var value: Int64?
 
@@ -307,6 +450,10 @@ private actor ORMGeneratedIDBox {
 }
 
 private enum ORMInsertConformanceError: Error, Sendable, Equatable {
+    case rollback
+}
+
+private enum ORMUpdateConformanceError: Error, Sendable, Equatable {
     case rollback
 }
 

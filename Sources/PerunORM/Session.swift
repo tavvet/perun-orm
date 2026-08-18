@@ -14,6 +14,20 @@ public enum ORMError: Error, Sendable, Equatable {
     case identityMapTypeMismatch(table: String, primaryKey: SQLValue)
     case multipleRowsForPrimaryKey(table: String, primaryKey: SQLValue)
     case hydratedPrimaryKeyMismatch(table: String, expected: SQLValue, actual: SQLValue)
+    case entityNotManaged(table: String, primaryKey: SQLValue)
+    case primaryKeyChanged(table: String, expected: SQLValue, actual: SQLValue)
+    case staleEntitySnapshot(table: String, primaryKey: SQLValue)
+    case entityNotFound(table: String, primaryKey: SQLValue)
+    case unexpectedUpdateAffectedRowCount(
+        table: String,
+        primaryKey: SQLValue,
+        actual: Int
+    )
+    case unexpectedUpdateResultRowCount(
+        table: String,
+        primaryKey: SQLValue,
+        actual: Int
+    )
     case generatedPrimaryKeyRetrievalUnsupported(table: String)
     case unexpectedInsertAffectedRowCount(table: String, actual: Int?)
     case unexpectedInsertResultRowCount(table: String, actual: Int)
@@ -32,16 +46,30 @@ fileprivate struct EntityFindPlan<E: Entity>: Sendable {
     let cachedEntity: E?
 }
 
+fileprivate struct ManagedEntitySnapshot: Sendable {
+    let entityType: ObjectIdentifier
+    let mappedValues: [SQLValue]
+    let primaryKey: SQLValue
+}
+
 fileprivate struct EntityInsertPlan: Sendable {
     let tableName: String
     let statement: SQLInsert
     let primaryKey: SQLValue
     let primaryKeyIsGenerated: Bool
+    let snapshot: ManagedEntitySnapshot
+}
+
+fileprivate struct EntityUpdatePlan: Sendable {
+    let tableName: String
+    let statement: SQLUpdate?
+    let primaryKey: SQLValue
+    let snapshot: ManagedEntitySnapshot
 }
 
 fileprivate struct UnitOfWorkChanges: Sendable {
     let invalidatesIdentity: Bool
-    let snapshots: [EntityKey: any Entity]
+    let snapshots: [EntityKey: ManagedEntitySnapshot]
 }
 
 private struct UnitOfWorkOutcome<Value: Sendable>: Sendable {
@@ -53,7 +81,7 @@ private struct UnitOfWorkOutcome<Value: Sendable>: Sendable {
 public actor Session {
     private let database: any Database
     private var validatedSchemas: [ObjectIdentifier: Any] = [:]
-    private var identity: [EntityKey: any Entity] = [:]
+    private var identity: [EntityKey: ManagedEntitySnapshot] = [:]
     private var activeUnitOfWork: UUID?
     private var activeDatabaseOperations = 0
 
@@ -77,13 +105,13 @@ public actor Session {
         let primaryKeyValue = primaryKey.sqlValue
         let key = EntityKey(type: ObjectIdentifier(type), primaryKey: primaryKeyValue)
         if let cached = identity[key] {
-            guard let entity = cached as? E else {
+            guard cached.entityType == ObjectIdentifier(type) else {
                 throw ORMError.identityMapTypeMismatch(
                     table: schema.tableName,
                     primaryKey: primaryKeyValue
                 )
             }
-            return entity
+            return try schema.materialize(from: cached.mappedValues)
         }
 
         let rendered = try SQLRenderer(dialect: database.dialect).render(
@@ -99,7 +127,8 @@ public actor Session {
         guard let row = result.rows.first else { return nil }
 
         let entity = try E(row: row)
-        let hydratedPrimaryKey = schema.primaryKey.read(from: entity)
+        let snapshot = managedSnapshot(of: entity, schema: schema)
+        let hydratedPrimaryKey = snapshot.primaryKey
         guard hydratedPrimaryKey == primaryKeyValue else {
             throw ORMError.hydratedPrimaryKeyMismatch(
                 table: schema.tableName,
@@ -107,7 +136,7 @@ public actor Session {
                 actual: hydratedPrimaryKey
             )
         }
-        identity[key] = entity
+        identity[key] = snapshot
         return entity
     }
 
@@ -181,6 +210,7 @@ public actor Session {
     fileprivate func unitOfWorkFindPlan<E: Entity>(
         for type: E.Type,
         primaryKey: E.PK,
+        overlaySnapshot: ManagedEntitySnapshot?,
         useCachedEntity: Bool,
         token: UUID
     ) throws -> EntityFindPlan<E> {
@@ -189,14 +219,15 @@ public actor Session {
         let primaryKeyValue = primaryKey.sqlValue
         let key = EntityKey(type: ObjectIdentifier(type), primaryKey: primaryKeyValue)
         let cachedEntity: E?
-        if useCachedEntity, let cached = identity[key] {
-            guard let entity = cached as? E else {
+        let cachedSnapshot = overlaySnapshot ?? (useCachedEntity ? identity[key] : nil)
+        if let cachedSnapshot {
+            guard cachedSnapshot.entityType == ObjectIdentifier(type) else {
                 throw ORMError.identityMapTypeMismatch(
                     table: schema.tableName,
                     primaryKey: primaryKeyValue
                 )
             }
-            cachedEntity = entity
+            cachedEntity = try schema.materialize(from: cachedSnapshot.mappedValues)
         } else {
             cachedEntity = nil
         }
@@ -214,20 +245,85 @@ public actor Session {
     ) throws -> EntityInsertPlan {
         try validateUnitOfWork(token)
         let schema = try validatedSchema(for: E.self)
+        let snapshot = managedSnapshot(of: entity, schema: schema)
         return EntityInsertPlan(
             tableName: schema.tableName,
-            statement: schema.insertStatement(entity, returning: returning),
-            primaryKey: schema.primaryKey.read(from: entity),
-            primaryKeyIsGenerated: schema.primaryKeyIsGenerated
+            statement: schema.insertStatement(
+                mappedValues: snapshot.mappedValues,
+                returning: returning
+            ),
+            primaryKey: snapshot.primaryKey,
+            primaryKeyIsGenerated: schema.primaryKeyIsGenerated,
+            snapshot: snapshot
         )
     }
 
-    fileprivate func unitOfWorkPrimaryKey<E: Entity>(
+    fileprivate func unitOfWorkUpdatePlan<E: Entity>(
+        for entity: E,
+        from originalSnapshot: ManagedEntitySnapshot,
+        overlaySnapshot: ManagedEntitySnapshot?,
+        useCachedEntity: Bool,
+        returning: Bool,
+        token: UUID
+    ) throws -> EntityUpdatePlan {
+        try validateUnitOfWork(token)
+        let schema = try validatedSchema(for: E.self)
+        guard originalSnapshot.entityType == ObjectIdentifier(E.self) else {
+            throw ORMError.identityMapTypeMismatch(
+                table: schema.tableName,
+                primaryKey: originalSnapshot.primaryKey
+            )
+        }
+        let originalValues = originalSnapshot.mappedValues
+        let updatedSnapshot = managedSnapshot(of: entity, schema: schema)
+        let primaryKey = originalSnapshot.primaryKey
+        let updatedPrimaryKey = updatedSnapshot.primaryKey
+        guard updatedPrimaryKey == primaryKey else {
+            throw ORMError.primaryKeyChanged(
+                table: schema.tableName,
+                expected: primaryKey,
+                actual: updatedPrimaryKey
+            )
+        }
+        let key = EntityKey(type: ObjectIdentifier(E.self), primaryKey: primaryKey)
+        let cachedSnapshot = overlaySnapshot ?? (useCachedEntity ? identity[key] : nil)
+        guard let cachedSnapshot else {
+            throw ORMError.entityNotManaged(
+                table: schema.tableName,
+                primaryKey: primaryKey
+            )
+        }
+        guard cachedSnapshot.entityType == ObjectIdentifier(E.self) else {
+            throw ORMError.identityMapTypeMismatch(
+                table: schema.tableName,
+                primaryKey: primaryKey
+            )
+        }
+        guard schema.hasSameMappedValues(cachedSnapshot.mappedValues, originalValues) else {
+            throw ORMError.staleEntitySnapshot(
+                table: schema.tableName,
+                primaryKey: primaryKey
+            )
+        }
+        return EntityUpdatePlan(
+            tableName: schema.tableName,
+            statement: schema.updateStatement(
+                mappedValues: updatedSnapshot.mappedValues,
+                comparedTo: cachedSnapshot.mappedValues,
+                returning: returning
+            ),
+            primaryKey: primaryKey,
+            snapshot: updatedSnapshot
+        )
+    }
+
+    fileprivate func unitOfWorkSnapshot<E: Entity>(
         of entity: E,
         token: UUID
-    ) throws -> SQLValue {
+    ) throws -> ManagedEntitySnapshot {
         try validateUnitOfWork(token)
-        return try validatedSchema(for: E.self).primaryKey.read(from: entity)
+        let schema = try validatedSchema(for: E.self)
+        return managedSnapshot(of: entity, schema: schema)
     }
 
     fileprivate func invalidateIdentityForUnitOfWork(token: UUID) {
@@ -244,6 +340,18 @@ public actor Session {
         guard activeUnitOfWork == token else {
             throw SessionError.unitOfWorkClosed
         }
+    }
+
+    private func managedSnapshot<E: Entity>(
+        of entity: E,
+        schema: EntitySchema<E>
+    ) -> ManagedEntitySnapshot {
+        let mappedValues = schema.mappedValues(of: entity)
+        return ManagedEntitySnapshot(
+            entityType: ObjectIdentifier(E.self),
+            mappedValues: mappedValues,
+            primaryKey: schema.primaryKeyValue(in: mappedValues)
+        )
     }
 }
 
@@ -262,7 +370,7 @@ public actor UnitOfWork {
     private var lifecycle = Lifecycle.open
     private var inFlightOperations = 0
     private var closeWaiters: [CheckedContinuation<Void, Never>] = []
-    private var overlay: [EntityKey: any Entity] = [:]
+    private var overlay: [EntityKey: ManagedEntitySnapshot] = [:]
     private var rollbackOnly = false
     private var invalidatesSessionIdentity = false
 
@@ -300,7 +408,7 @@ public actor UnitOfWork {
         return result
     }
 
-    /// Returns the transactional snapshot for a primary key, including local inserts.
+    /// Returns the transactional snapshot for a primary key, including local writes.
     public func find<E: Entity>(_ type: E.Type, _ primaryKey: E.PK) async throws -> E? {
         try beginOperation()
         defer { endOperation() }
@@ -310,18 +418,10 @@ public actor UnitOfWork {
         let plan = try await session.unitOfWorkFindPlan(
             for: type,
             primaryKey: primaryKey,
+            overlaySnapshot: overlay[key],
             useCachedEntity: !invalidatesSessionIdentity,
             token: token
         )
-        if let cached = overlay[key] {
-            guard let entity = cached as? E else {
-                throw ORMError.identityMapTypeMismatch(
-                    table: plan.tableName,
-                    primaryKey: primaryKeyValue
-                )
-            }
-            return entity
-        }
         if let cached = plan.cachedEntity {
             return cached
         }
@@ -337,18 +437,18 @@ public actor UnitOfWork {
         guard let row = result.rows.first else { return nil }
 
         let entity = try E(row: row)
-        let hydratedPrimaryKey = try await session.unitOfWorkPrimaryKey(
+        let snapshot = try await session.unitOfWorkSnapshot(
             of: entity,
             token: token
         )
-        guard hydratedPrimaryKey == primaryKeyValue else {
+        guard snapshot.primaryKey == primaryKeyValue else {
             throw ORMError.hydratedPrimaryKeyMismatch(
                 table: plan.tableName,
                 expected: primaryKeyValue,
-                actual: hydratedPrimaryKey
+                actual: snapshot.primaryKey
             )
         }
-        overlay[key] = entity
+        overlay[key] = snapshot
         return entity
     }
 
@@ -414,7 +514,80 @@ public actor UnitOfWork {
             )
             writeCompleted = true
             try validateKnownAffectedRowCount(result.rowsAffected, table: plan.tableName)
-            return await stageInserted(entity, primaryKey: plan.primaryKey)
+            return await stageInserted(entity, snapshot: plan.snapshot)
+        } catch {
+            if writeCompleted {
+                rollbackOnly = true
+            }
+            throw error
+        }
+    }
+
+    /// Updates the latest managed snapshot by its dirty mapped fields.
+    /// `snapshot` must be the latest value returned by find, insert, or update.
+    public func update<E: Entity>(_ entity: E, from snapshot: E) async throws -> E {
+        try beginOperation()
+        defer { endOperation() }
+
+        var writeCompleted = false
+        do {
+            let usesReturning = dialect.capabilities.contains(.returning)
+            let originalSnapshot = try await session.unitOfWorkSnapshot(
+                of: snapshot,
+                token: token
+            )
+            let primaryKey = originalSnapshot.primaryKey
+            let key = EntityKey(type: ObjectIdentifier(E.self), primaryKey: primaryKey)
+            let plan = try await session.unitOfWorkUpdatePlan(
+                for: entity,
+                from: originalSnapshot,
+                overlaySnapshot: overlay[key],
+                useCachedEntity: !invalidatesSessionIdentity,
+                returning: usesReturning,
+                token: token
+            )
+
+            guard let statement = plan.statement else {
+                overlay[key] = plan.snapshot
+                return entity
+            }
+
+            let rendered = try SQLRenderer(dialect: dialect).render(statement)
+            let result = try await executeTransaction(rendered.sql, rendered.parameters)
+            writeCompleted = true
+            await session.invalidateIdentityKeyForUnitOfWork(key, token: token)
+            try validateUpdateAffectedRowCount(
+                result.rowsAffected,
+                table: plan.tableName,
+                primaryKey: plan.primaryKey
+            )
+
+            if usesReturning {
+                guard result.rows.count == 1, let row = result.rows.first else {
+                    throw ORMError.unexpectedUpdateResultRowCount(
+                        table: plan.tableName,
+                        primaryKey: plan.primaryKey,
+                        actual: result.rows.count
+                    )
+                }
+                let updated = try E(row: row)
+                let updatedSnapshot = try await session.unitOfWorkSnapshot(
+                    of: updated,
+                    token: token
+                )
+                guard updatedSnapshot.primaryKey == plan.primaryKey else {
+                    throw ORMError.hydratedPrimaryKeyMismatch(
+                        table: plan.tableName,
+                        expected: plan.primaryKey,
+                        actual: updatedSnapshot.primaryKey
+                    )
+                }
+                overlay[key] = updatedSnapshot
+                return updated
+            }
+
+            overlay[key] = plan.snapshot
+            return entity
         } catch {
             if writeCompleted {
                 rollbackOnly = true
@@ -494,6 +667,24 @@ public actor UnitOfWork {
         }
     }
 
+    private func validateUpdateAffectedRowCount(
+        _ actual: Int?,
+        table: String,
+        primaryKey: SQLValue
+    ) throws {
+        guard let actual else { return }
+        if actual == 0 {
+            throw ORMError.entityNotFound(table: table, primaryKey: primaryKey)
+        }
+        if actual != 1 {
+            throw ORMError.unexpectedUpdateAffectedRowCount(
+                table: table,
+                primaryKey: primaryKey,
+                actual: actual
+            )
+        }
+    }
+
     private var changes: UnitOfWorkChanges {
         UnitOfWorkChanges(
             invalidatesIdentity: invalidatesSessionIdentity,
@@ -505,15 +696,15 @@ public actor UnitOfWork {
         _ inserted: E,
         plan: EntityInsertPlan
     ) async throws -> E {
-        let primaryKey = try await session.unitOfWorkPrimaryKey(of: inserted, token: token)
-        if !plan.primaryKeyIsGenerated, primaryKey != plan.primaryKey {
+        let snapshot = try await session.unitOfWorkSnapshot(of: inserted, token: token)
+        if !plan.primaryKeyIsGenerated, snapshot.primaryKey != plan.primaryKey {
             throw ORMError.hydratedPrimaryKeyMismatch(
                 table: plan.tableName,
                 expected: plan.primaryKey,
-                actual: primaryKey
+                actual: snapshot.primaryKey
             )
         }
-        return await stageInserted(inserted, primaryKey: primaryKey)
+        return await stageInserted(inserted, snapshot: snapshot)
     }
 
     private func loadInserted<E: Entity>(
@@ -525,6 +716,7 @@ public actor UnitOfWork {
         let plan = try await session.unitOfWorkFindPlan(
             for: type,
             primaryKey: primaryKey,
+            overlaySnapshot: nil,
             useCachedEntity: false,
             token: token
         )
@@ -538,26 +730,26 @@ public actor UnitOfWork {
             )
         }
         let inserted = try E(row: row)
-        let hydratedPrimaryKey = try await session.unitOfWorkPrimaryKey(
+        let snapshot = try await session.unitOfWorkSnapshot(
             of: inserted,
             token: token
         )
-        guard hydratedPrimaryKey == primaryKeyValue else {
+        guard snapshot.primaryKey == primaryKeyValue else {
             throw ORMError.hydratedPrimaryKeyMismatch(
                 table: table,
                 expected: primaryKeyValue,
-                actual: hydratedPrimaryKey
+                actual: snapshot.primaryKey
             )
         }
-        return await stageInserted(inserted, primaryKey: primaryKeyValue)
+        return await stageInserted(inserted, snapshot: snapshot)
     }
 
     private func stageInserted<E: Entity>(
         _ inserted: E,
-        primaryKey: SQLValue
+        snapshot: ManagedEntitySnapshot
     ) async -> E {
-        let key = EntityKey(type: ObjectIdentifier(E.self), primaryKey: primaryKey)
-        overlay[key] = inserted
+        let key = EntityKey(type: ObjectIdentifier(E.self), primaryKey: snapshot.primaryKey)
+        overlay[key] = snapshot
         // COMMIT may succeed before its caller observes cancellation or a timeout.
         await session.invalidateIdentityKeyForUnitOfWork(key, token: token)
         return inserted
