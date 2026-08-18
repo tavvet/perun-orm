@@ -59,7 +59,6 @@ private func runSharedDBALConformance(
             database: database,
             dialect: dialect,
             tableName: tableName,
-            table: table,
             columns: columns
         )
         _ = try await database.execute(dropSQL, [])
@@ -273,10 +272,18 @@ private func assertAffectedRowsAndTransactions(
     let countRow = try #require(countResult.rows.first)
     #expect(try countRow.decode("count", as: Int64.self) == 2)
 
-    let deleteSQL = "DELETE FROM \(table) WHERE \(columns.id) = \(dialect.placeholder(at: 1))"
-    let deleted = try await database.execute(deleteSQL, [.int(2)])
+    let renderedDelete = try renderDelete(dialect: dialect, tableName: tableName, id: 2)
+    let deleted = try await database.execute(renderedDelete.sql, renderedDelete.parameters)
     #expect(deleted.rowsAffected == 1)
-    let deletedAgain = try await database.execute(deleteSQL, [.int(2)])
+    let renderedMissingDelete = try renderDelete(
+        dialect: dialect,
+        tableName: tableName,
+        id: 2
+    )
+    let deletedAgain = try await database.execute(
+        renderedMissingDelete.sql,
+        renderedMissingDelete.parameters
+    )
     #expect(deletedAgain.rowsAffected == 0)
 }
 
@@ -315,11 +322,25 @@ private func renderUpdate(
     )
 }
 
+private func renderDelete(
+    dialect: any SQLDialect,
+    tableName: String,
+    id: Int64,
+    returning: [String] = []
+) throws -> RenderedSQL {
+    try SQLRenderer(dialect: dialect).render(
+        SQLDelete(
+            table: tableName,
+            predicate: .comparison(column: "id", op: .eq, value: .int(id)),
+            returning: returning
+        )
+    )
+}
+
 private func assertReturningCapability(
     database: any Database,
     dialect: any SQLDialect,
     tableName: String,
-    table: String,
     columns: DBALConformanceColumns
 ) async throws {
     guard dialect.capabilities.contains(.returning) else { return }
@@ -360,9 +381,22 @@ private func assertReturningCapability(
     #expect(try updatedRow.decode("id", as: Int64.self) == values.id)
     #expect(try updatedRow.decode("name", as: String.self) == updatedName)
 
-    let deleteSQL = "DELETE FROM \(table) WHERE \(columns.id) = \(dialect.placeholder(at: 1))"
-    let deleted = try await database.execute(deleteSQL, [.int(values.id)])
-    #expect(deleted.rowsAffected == 1)
+    let renderedDelete = try renderDelete(
+        dialect: dialect,
+        tableName: tableName,
+        id: values.id,
+        returning: ["id", "name"]
+    )
+    let deleteResult = try await database.execute(
+        renderedDelete.sql,
+        renderedDelete.parameters
+    )
+    #expect(deleteResult.rowsAffected == 1)
+    #expect(deleteResult.rows.count == 1)
+
+    let deletedRow = try #require(deleteResult.rows.first)
+    #expect(try deletedRow.decode("id", as: Int64.self) == values.id)
+    #expect(try deletedRow.decode("name", as: String.self) == updatedName)
 }
 
 private struct DBALConformanceSchema: Sendable {

@@ -42,6 +42,10 @@ public struct PostgresDialect: SQLDialect {
         returningPlan(columns: columns)
     }
 
+    public func deleteReturningPlan(columns: [String]) -> SQLDMLReturningPlan? {
+        returningPlan(columns: columns)
+    }
+
     private func returningPlan(columns: [String]) -> SQLDMLReturningPlan {
         var fragments: [SQLDMLReturningFragment] = [.literal("RETURNING ")]
         for (index, column) in columns.enumerated() {

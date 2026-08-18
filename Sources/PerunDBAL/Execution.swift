@@ -159,6 +159,7 @@ public protocol SQLDialect: Sendable {
     ) throws -> SQLPaginationPlan
     func insertReturningPlan(columns: [String]) throws -> SQLDMLReturningPlan?
     func updateReturningPlan(columns: [String]) throws -> SQLDMLReturningPlan?
+    func deleteReturningPlan(columns: [String]) throws -> SQLDMLReturningPlan?
 }
 
 public extension SQLDialect {
@@ -195,6 +196,11 @@ public extension SQLDialect {
 
     /// The standard default does not assume a backend-specific row-returning grammar.
     func updateReturningPlan(columns: [String]) throws -> SQLDMLReturningPlan? {
+        nil
+    }
+
+    /// The standard default does not assume a backend-specific row-returning grammar.
+    func deleteReturningPlan(columns: [String]) throws -> SQLDMLReturningPlan? {
         nil
     }
 }

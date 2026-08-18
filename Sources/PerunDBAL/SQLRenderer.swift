@@ -118,6 +118,23 @@ public struct SQLUpdate: Sendable, Hashable {
     }
 }
 
+/// A single-table DELETE. The predicate argument is required; explicit `nil` targets every row.
+public struct SQLDelete: Sendable, Hashable {
+    public let table: String
+    public let predicate: SQLPredicate?
+    public let returning: [String]
+
+    public init(
+        table: String,
+        predicate: SQLPredicate?,
+        returning: [String] = []
+    ) {
+        self.table = table
+        self.predicate = predicate
+        self.returning = returning
+    }
+}
+
 public enum SQLRenderError: Error, Sendable, Equatable {
     case emptyTable
     case noSelectedColumns
@@ -260,6 +277,30 @@ public struct SQLRenderer: Sendable {
         }
 
         if let predicate = update.predicate {
+            sql += " WHERE \(try render(predicate, binder: &binder))"
+        }
+
+        if let returningPlan, returningPlan.placement == .suffix {
+            sql += " " + render(returningPlan)
+        }
+
+        return RenderedSQL(sql: sql, parameters: binder.parameters)
+    }
+
+    public func render(_ delete: SQLDelete) throws -> RenderedSQL {
+        try validateTable(delete.table)
+        let returningPlan = try returningPlan(for: delete.returning) {
+            try dialect.deleteReturningPlan(columns: $0)
+        }
+
+        var binder = ParamBinder(dialect: dialect)
+        var sql = "DELETE FROM \(dialect.quoteIdentifier(delete.table))"
+
+        if let returningPlan, returningPlan.placement == .embedded {
+            sql += " " + render(returningPlan)
+        }
+
+        if let predicate = delete.predicate {
             sql += " WHERE \(try render(predicate, binder: &binder))"
         }
 
