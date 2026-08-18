@@ -52,6 +52,10 @@ fileprivate struct EntityFindPlan<E: Entity>: Sendable {
     let isDeleted: Bool
 }
 
+fileprivate struct EntityFetchPlan: Sendable {
+    let statement: SQLSelect
+}
+
 fileprivate struct ManagedEntitySnapshot: Sendable {
     let entityType: ObjectIdentifier
     let mappedValues: [SQLValue]
@@ -61,6 +65,11 @@ fileprivate struct ManagedEntitySnapshot: Sendable {
 fileprivate enum ManagedEntityState: Sendable {
     case snapshot(ManagedEntitySnapshot)
     case deleted
+}
+
+fileprivate struct EntityFetchBatch<E: Entity>: Sendable {
+    let entities: [E]
+    let snapshots: [EntityKey: ManagedEntitySnapshot]
 }
 
 fileprivate struct EntityInsertPlan: Sendable {
@@ -155,6 +164,21 @@ public actor Session {
         }
         identity[key] = snapshot
         return entity
+    }
+
+    /// Executes a typed SELECT and refreshes every returned identity snapshot atomically.
+    public func fetch<E: Entity>(_ query: Query<E>) async throws -> [E] {
+        try beginDirectDatabaseOperation()
+        defer { endDirectDatabaseOperation() }
+
+        let schema = try validatedSchema(for: E.self)
+        let rendered = try SQLRenderer(dialect: database.dialect).render(query.statement)
+        let result = try await database.execute(rendered.sql, rendered.parameters)
+        let batch = try hydrate(result.rows, schema: schema)
+        for (key, snapshot) in batch.snapshots {
+            identity[key] = snapshot
+        }
+        return batch.entities
     }
 
     public func withUnitOfWork<T: Sendable>(
@@ -271,6 +295,25 @@ public actor Session {
             cachedEntity: cachedEntity,
             isDeleted: isDeleted
         )
+    }
+
+    fileprivate func unitOfWorkFetchPlan<E: Entity>(
+        for query: Query<E>,
+        token: UUID
+    ) throws -> EntityFetchPlan {
+        try validateUnitOfWork(token)
+        _ = try validatedSchema(for: E.self)
+        return EntityFetchPlan(statement: query.statement)
+    }
+
+    fileprivate func unitOfWorkHydrate<E: Entity>(
+        _ rows: [any Row],
+        as type: E.Type,
+        token: UUID
+    ) throws -> EntityFetchBatch<E> {
+        try validateUnitOfWork(token)
+        let schema = try validatedSchema(for: type)
+        return try hydrate(rows, schema: schema)
     }
 
     fileprivate func unitOfWorkInsertPlan<E: Entity>(
@@ -450,6 +493,35 @@ public actor Session {
             primaryKey: schema.primaryKeyValue(in: mappedValues)
         )
     }
+
+    private func hydrate<E: Entity>(
+        _ rows: [any Row],
+        schema: EntitySchema<E>
+    ) throws -> EntityFetchBatch<E> {
+        var entities: [E] = []
+        var snapshots: [EntityKey: ManagedEntitySnapshot] = [:]
+        entities.reserveCapacity(rows.count)
+        snapshots.reserveCapacity(rows.count)
+
+        for row in rows {
+            let entity = try E(row: row)
+            let snapshot = managedSnapshot(of: entity, schema: schema)
+            let key = EntityKey(
+                type: ObjectIdentifier(E.self),
+                primaryKey: snapshot.primaryKey
+            )
+            guard snapshots[key] == nil else {
+                throw ORMError.multipleRowsForPrimaryKey(
+                    table: schema.tableName,
+                    primaryKey: snapshot.primaryKey
+                )
+            }
+            entities.append(entity)
+            snapshots[key] = snapshot
+        }
+
+        return EntityFetchBatch(entities: entities, snapshots: snapshots)
+    }
 }
 
 /// The scoped transactional executor. Its snapshots reach the session only after commit.
@@ -550,6 +622,25 @@ public actor UnitOfWork {
         }
         overlay[key] = .snapshot(snapshot)
         return entity
+    }
+
+    /// Executes a typed transactional SELECT and stages all returned snapshots atomically.
+    public func fetch<E: Entity>(_ query: Query<E>) async throws -> [E] {
+        try beginOperation()
+        defer { endOperation() }
+
+        let plan = try await session.unitOfWorkFetchPlan(for: query, token: token)
+        let rendered = try SQLRenderer(dialect: dialect).render(plan.statement)
+        let result = try await executeTransaction(rendered.sql, rendered.parameters)
+        let batch = try await session.unitOfWorkHydrate(
+            result.rows,
+            as: E.self,
+            token: token
+        )
+        for (key, snapshot) in batch.snapshots {
+            overlay[key] = .snapshot(snapshot)
+        }
+        return batch.entities
     }
 
     /// Inserts one entity eagerly and returns the snapshot carrying its final primary key.

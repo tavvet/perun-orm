@@ -55,6 +55,7 @@ func entitySchemaRejectsDuplicateKeyPaths() {
 func unitOfWorkOwnsTheTransactionAndClosesAfterTheBody() async throws {
     let recorder = Recorder()
     let session = Session(database: FakeDatabase(recorder: recorder))
+    let query = try Query(User.self)
 
     let escapedUnitOfWork = try await session.withUnitOfWork { unitOfWork in
         _ = try await unitOfWork.execute("inside", [.int(1)])
@@ -69,6 +70,13 @@ func unitOfWorkOwnsTheTransactionAndClosesAfterTheBody() async throws {
         do {
             _ = try await session.find(User.self, 1)
             Issue.record("session find unexpectedly entered an active unit of work")
+        } catch let error as SessionError {
+            #expect(error == .sessionBusy)
+        }
+
+        do {
+            _ = try await session.fetch(query)
+            Issue.record("session fetch unexpectedly entered an active unit of work")
         } catch let error as SessionError {
             #expect(error == .sessionBusy)
         }

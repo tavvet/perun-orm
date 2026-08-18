@@ -75,6 +75,23 @@ func postgresPassesSharedORMDeleteConformance() async throws {
     )
 }
 
+@Test
+func sqlitePassesSharedORMQueryConformance() async throws {
+    try await runSharedORMQueryConformance(
+        database: SQLiteDatabase(configuration: .memory(), maxConnections: 1)
+    )
+}
+
+@Test(.enabled(if: ProcessInfo.processInfo.environment["PERUN_PGSQL_INTEGRATION"] == "1"))
+func postgresPassesSharedORMQueryConformance() async throws {
+    try await runSharedORMQueryConformance(
+        database: PostgresDatabase(
+            configuration: ormPostgresIntegrationConfiguration(),
+            maxConnections: 1
+        )
+    )
+}
+
 private func runSharedORMFindConformance(database: any Database) async throws {
     let dialect = database.dialect
     let renderer = SQLRenderer(dialect: dialect)
@@ -440,6 +457,159 @@ private func runSharedORMDeleteConformance(database: any Database) async throws 
     await database.shutdown()
 }
 
+private func runSharedORMQueryConformance(database: any Database) async throws {
+    let dialect = database.dialect
+    let renderer = SQLRenderer(dialect: dialect)
+    let tableName = ORMQueryRecord.tableName
+    let table = dialect.quoteIdentifier(tableName)
+    let dropSQL = "DROP TABLE IF EXISTS \(table)"
+
+    do {
+        _ = try await database.execute(dropSQL, [])
+
+        let schema = try EntitySchema(ORMQueryRecord.self)
+        let createTable = try renderer.render(schema.createTableStatement)
+        _ = try await database.execute(createTable.sql, createTable.parameters)
+
+        let first = ORMQueryRecord(
+            id: 1,
+            name: "alpha",
+            nickname: nil,
+            isActive: true
+        )
+        let second = ORMQueryRecord(
+            id: 2,
+            name: "beta",
+            nickname: "blue",
+            isActive: false
+        )
+        let third = ORMQueryRecord(
+            id: 3,
+            name: "gamma",
+            nickname: nil,
+            isActive: true
+        )
+
+        for record in [first, second, third] {
+            let insert = try renderer.render(
+                SQLInsert(
+                    table: tableName,
+                    values: [
+                        SQLColumnValue(column: "id", value: .int(record.id)),
+                        SQLColumnValue(column: "name", value: .text(record.name)),
+                        SQLColumnValue(
+                            column: "nickname",
+                            value: record.nickname.map(SQLValue.text) ?? .null
+                        ),
+                        SQLColumnValue(
+                            column: "is_active",
+                            value: .bool(record.isActive)
+                        ),
+                    ]
+                )
+            )
+            let result = try await database.execute(insert.sql, insert.parameters)
+            #expect(result.rowsAffected == 1)
+        }
+
+        let active = try Predicate<ORMQueryRecord>.eq(\ORMQueryRecord.isActive, true)
+        let nilNickname: [String?] = [nil]
+        let withoutNickname = try Predicate<ORMQueryRecord>.in(
+            \ORMQueryRecord.nickname,
+            nilNickname
+        )
+        let limitedQuery = try Query(ORMQueryRecord.self)
+            .where(active.and(withoutNickname))
+            .order(by: \ORMQueryRecord.id, desc: true)
+            .limit(1)
+
+        let session = Session(database: database)
+        #expect(try await session.fetch(limitedQuery) == [third])
+        #expect(try await session.find(ORMQueryRecord.self, third.id) == third)
+
+        let refreshedThird = ORMQueryRecord(
+            id: third.id,
+            name: "gamma-refreshed",
+            nickname: nil,
+            isActive: true
+        )
+        let externalUpdate = try renderer.render(
+            SQLUpdate(
+                table: tableName,
+                assignments: [
+                    SQLColumnValue(column: "name", value: .text(refreshedThird.name)),
+                ],
+                predicate: .comparison(column: "id", op: .eq, value: .int(third.id))
+            )
+        )
+        let externalUpdateResult = try await database.execute(
+            externalUpdate.sql,
+            externalUpdate.parameters
+        )
+        #expect(externalUpdateResult.rowsAffected == 1)
+        #expect(try await session.find(ORMQueryRecord.self, third.id) == third)
+
+        let thirdPredicate = try Predicate<ORMQueryRecord>.eq(
+            \ORMQueryRecord.id,
+            third.id
+        )
+        let thirdQuery = try Query(ORMQueryRecord.self).where(thirdPredicate)
+        #expect(try await session.fetch(thirdQuery) == [refreshedThird])
+        #expect(try await session.find(ORMQueryRecord.self, third.id) == refreshedThird)
+
+        let managedFirst = try #require(
+            await session.find(ORMQueryRecord.self, first.id)
+        )
+        let managedSecond = try #require(
+            await session.find(ORMQueryRecord.self, second.id)
+        )
+        let updatedFirst = ORMQueryRecord(
+            id: first.id,
+            name: "alpha-updated",
+            nickname: "one",
+            isActive: false
+        )
+        let fourth = ORMQueryRecord(
+            id: 4,
+            name: "delta",
+            nickname: nil,
+            isActive: true
+        )
+        let allQuery = try Query(ORMQueryRecord.self).order(by: \ORMQueryRecord.id)
+
+        let transactionalRows = try await session.withUnitOfWork { unitOfWork in
+            _ = try await unitOfWork.update(updatedFirst, from: managedFirst)
+            try await unitOfWork.delete(managedSecond)
+            _ = try await unitOfWork.insert(fourth)
+
+            let rows = try await unitOfWork.fetch(allQuery)
+            #expect(rows == [updatedFirst, refreshedThird, fourth])
+            #expect(try await unitOfWork.find(ORMQueryRecord.self, first.id) == updatedFirst)
+            #expect(try await unitOfWork.find(ORMQueryRecord.self, second.id) == nil)
+            #expect(try await unitOfWork.find(ORMQueryRecord.self, fourth.id) == fourth)
+            return rows
+        }
+        #expect(transactionalRows == [updatedFirst, refreshedThird, fourth])
+
+        #expect(try await session.find(ORMQueryRecord.self, first.id) == updatedFirst)
+        #expect(try await session.find(ORMQueryRecord.self, second.id) == nil)
+        #expect(try await session.find(ORMQueryRecord.self, fourth.id) == fourth)
+        let freshSession = Session(database: database)
+        #expect(
+            try await freshSession.fetch(allQuery)
+                == [updatedFirst, refreshedThird, fourth]
+        )
+
+        _ = try await database.execute(dropSQL, [])
+    } catch {
+        _ = try? await database.execute(dropSQL, [])
+        await database.shutdown()
+        throw error
+    }
+
+    await database.shutdown()
+}
+
 private struct ORMFindRecord: Entity, Equatable {
     typealias PK = Int64
 
@@ -574,6 +744,44 @@ private struct ORMDeleteRecord: Entity, Equatable {
             FieldDescriptor(\ORMDeleteRecord.name, column: "name"),
             FieldDescriptor(\ORMDeleteRecord.nickname, column: "nickname"),
             FieldDescriptor(\ORMDeleteRecord.isActive, column: "is_active"),
+        ]
+    }
+
+    init(id: Int64, name: String, nickname: String?, isActive: Bool) {
+        self.id = id
+        self.name = name
+        self.nickname = nickname
+        self.isActive = isActive
+    }
+
+    init(row: any Row) throws {
+        id = try row.decode("id", as: Int64.self)
+        name = try row.decode("name", as: String.self)
+        nickname = try row.decode("nickname", as: String?.self)
+        isActive = try row.decode("is_active", as: Bool.self)
+    }
+}
+
+private struct ORMQueryRecord: Entity, Equatable {
+    typealias PK = Int64
+
+    let id: Int64
+    let name: String
+    let nickname: String?
+    let isActive: Bool
+
+    static let tableName = "perun_orm_query_"
+        + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+    static var fields: [FieldDescriptor<ORMQueryRecord>] {
+        [
+            FieldDescriptor(
+                \ORMQueryRecord.id,
+                column: "id",
+                role: .primaryKey(generated: false)
+            ),
+            FieldDescriptor(\ORMQueryRecord.name, column: "name"),
+            FieldDescriptor(\ORMQueryRecord.nickname, column: "nickname"),
+            FieldDescriptor(\ORMQueryRecord.isActive, column: "is_active"),
         ]
     }
 
