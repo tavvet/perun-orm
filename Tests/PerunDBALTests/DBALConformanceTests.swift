@@ -9,8 +9,7 @@ import Testing
 @Test
 func sqlitePassesSharedDBALConformance() async throws {
     try await runSharedDBALConformance(
-        database: SQLiteDatabase(configuration: .memory(), maxConnections: 1),
-        schema: .sqlite
+        database: SQLiteDatabase(configuration: .memory(), maxConnections: 1)
     )
 }
 
@@ -20,25 +19,38 @@ func postgresPassesSharedDBALConformance() async throws {
         database: PostgresDatabase(
             configuration: postgresIntegrationConfiguration(),
             maxConnections: 1
-        ),
-        schema: .postgres
+        )
     )
 }
 
 private func runSharedDBALConformance(
-    database: any Database,
-    schema: DBALConformanceSchema
+    database: any Database
 ) async throws {
     let dialect = database.dialect
     let tableName = "perun_dbal_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
     let table = dialect.quoteIdentifier(tableName)
     let columns = DBALConformanceColumns(dialect: dialect)
     let dropSQL = "DROP TABLE IF EXISTS \(table)"
+    let generatedTableName = tableName + "_generated"
+    let generatedTable = dialect.quoteIdentifier(generatedTableName)
+    let dropGeneratedSQL = "DROP TABLE IF EXISTS \(generatedTable)"
 
     do {
-        _ = try await database.execute(
-            schema.createTableSQL(table: table, columns: columns),
-            []
+        let renderedCreateTable = try renderConformanceTable(
+            dialect: dialect,
+            tableName: tableName
+        )
+        _ = try await database.execute(renderedCreateTable.sql, renderedCreateTable.parameters)
+        try await assertOrdinaryPrimaryKeyIsRequired(
+            database: database,
+            dialect: dialect,
+            tableName: tableName,
+            columns: columns
+        )
+        try await assertGeneratedIdentityDDL(
+            database: database,
+            dialect: dialect,
+            tableName: generatedTableName
         )
         try await assertPortableBindingErrors(database: database, dialect: dialect)
         try await assertPortableRoundTrip(
@@ -61,8 +73,10 @@ private func runSharedDBALConformance(
             tableName: tableName,
             columns: columns
         )
+        _ = try await database.execute(dropGeneratedSQL, [])
         _ = try await database.execute(dropSQL, [])
     } catch {
+        _ = try? await database.execute(dropGeneratedSQL, [])
         _ = try? await database.execute(dropSQL, [])
         await database.shutdown()
         throw error
@@ -292,17 +306,53 @@ private func renderInsert(
     tableName: String,
     columns: DBALConformanceColumns,
     values: DBALConformanceValues,
+    includingPrimaryKey: Bool = true,
     returning: [String] = []
 ) throws -> RenderedSQL {
     let columnNames = columns.names
     let parameters = values.parameters
     try #require(columnNames.count == parameters.count)
-    let columnValues = zip(columnNames, parameters).map { column, value in
+    let pairs = includingPrimaryKey
+        ? Array(zip(columnNames, parameters))
+        : Array(zip(columnNames, parameters).dropFirst())
+    let columnValues = pairs.map { column, value in
         SQLColumnValue(column: column, value: value)
     }
     return try SQLRenderer(dialect: dialect).render(
         SQLInsert(table: tableName, values: columnValues, returning: returning)
     )
+}
+
+private func assertOrdinaryPrimaryKeyIsRequired(
+    database: any Database,
+    dialect: any SQLDialect,
+    tableName: String,
+    columns: DBALConformanceColumns
+) async throws {
+    let name = "ordinary-primary-key-must-be-supplied"
+    let values = try DBALConformanceValues.make(id: 0, name: name)
+    let renderedInsert = try renderInsert(
+        dialect: dialect,
+        tableName: tableName,
+        columns: columns,
+        values: values,
+        includingPrimaryKey: false
+    )
+
+    do {
+        _ = try await database.execute(renderedInsert.sql, renderedInsert.parameters)
+    } catch {
+        return
+    }
+
+    Issue.record("database generated a primary key declared with generated: false")
+    let cleanup = try SQLRenderer(dialect: dialect).render(
+        SQLDelete(
+            table: tableName,
+            predicate: .comparison(column: "name", op: .eq, value: .text(name))
+        )
+    )
+    _ = try await database.execute(cleanup.sql, cleanup.parameters)
 }
 
 private func renderUpdate(
@@ -399,54 +449,94 @@ private func assertReturningCapability(
     #expect(try deletedRow.decode("name", as: String.self) == updatedName)
 }
 
-private struct DBALConformanceSchema: Sendable {
-    let boolean: String
-    let int32: String
-    let int64: String
-    let double: String
-    let text: String
-    let blob: String
-    let timestamp: String
-    let uuid: String
-
-    static let sqlite = Self(
-        boolean: "INTEGER",
-        int32: "INTEGER",
-        int64: "INTEGER",
-        double: "REAL",
-        text: "TEXT",
-        blob: "BLOB",
-        timestamp: "TEXT",
-        uuid: "TEXT"
-    )
-
-    static let postgres = Self(
-        boolean: "boolean",
-        int32: "integer",
-        int64: "bigint",
-        double: "double precision",
-        text: "text",
-        blob: "bytea",
-        timestamp: "timestamptz",
-        uuid: "uuid"
-    )
-
-    func createTableSQL(table: String, columns: DBALConformanceColumns) -> String {
-        """
-        CREATE TABLE \(table) (
-            \(columns.id) \(int64) PRIMARY KEY,
-            \(columns.flag) \(boolean) NOT NULL,
-            \(columns.small) \(int32) NOT NULL,
-            \(columns.large) \(int64) NOT NULL,
-            \(columns.score) \(double) NOT NULL,
-            \(columns.name) \(text) NOT NULL,
-            \(columns.payload) \(blob) NOT NULL,
-            \(columns.createdAt) \(timestamp) NOT NULL,
-            \(columns.token) \(uuid) NOT NULL,
-            \(columns.absent) \(text)
+private func renderConformanceTable(
+    dialect: any SQLDialect,
+    tableName: String
+) throws -> RenderedSQL {
+    try SQLRenderer(dialect: dialect).render(
+        SQLCreateTable(
+            table: tableName,
+            columns: [
+                SQLColumnDefinition(
+                    name: "id",
+                    type: .int64,
+                    role: .primaryKey(generated: false)
+                ),
+                SQLColumnDefinition(name: "flag", type: .boolean),
+                SQLColumnDefinition(name: "small", type: .int32),
+                SQLColumnDefinition(name: "large", type: .int64),
+                SQLColumnDefinition(name: "score", type: .double),
+                SQLColumnDefinition(name: "name", type: .text),
+                SQLColumnDefinition(name: "payload", type: .blob),
+                SQLColumnDefinition(name: "created_at", type: .timestamp),
+                SQLColumnDefinition(name: "token", type: .uuid),
+                SQLColumnDefinition(name: "absent", type: .text, nullable: true),
+            ]
         )
-        """
+    )
+}
+
+private func assertGeneratedIdentityDDL(
+    database: any Database,
+    dialect: any SQLDialect,
+    tableName: String
+) async throws {
+    let renderer = SQLRenderer(dialect: dialect)
+    let renderedCreateTable = try renderer.render(
+        SQLCreateTable(
+            table: tableName,
+            columns: [
+                SQLColumnDefinition(
+                    name: "id",
+                    type: .int64,
+                    role: .primaryKey(generated: true)
+                ),
+                SQLColumnDefinition(name: "token", type: .text, unique: true),
+            ]
+        )
+    )
+    _ = try await database.execute(renderedCreateTable.sql, renderedCreateTable.parameters)
+
+    let token = "generated"
+    let returning = dialect.capabilities.contains(.returning) ? ["id"] : []
+    let renderedInsert = try renderer.render(
+        SQLInsert(
+            table: tableName,
+            values: [SQLColumnValue(column: "token", value: .text(token))],
+            returning: returning
+        )
+    )
+
+    let generatedID: Int64
+    if dialect.capabilities.contains(.returning) {
+        let result = try await database.execute(renderedInsert.sql, renderedInsert.parameters)
+        #expect(result.rowsAffected == 1)
+        #expect(result.rows.count == 1)
+        #expect(result.lastInsertRowID == nil)
+        generatedID = try #require(result.rows.first).decode("id", as: Int64.self)
+    } else {
+        try #require(dialect.capabilities.contains(.lastInsertRowID))
+        let result = try await database.execute(
+            renderedInsert.sql,
+            renderedInsert.parameters,
+            intent: .generatedRowIDInsert
+        )
+        #expect(result.rowsAffected == 1)
+        #expect(result.rows.isEmpty)
+        generatedID = try #require(result.lastInsertRowID)
     }
+
+    let renderedSelect = try renderer.render(
+        SQLSelect(
+            table: tableName,
+            columns: ["id", "token"],
+            predicate: .comparison(column: "id", op: .eq, value: .int(generatedID))
+        )
+    )
+    let selected = try await database.execute(renderedSelect.sql, renderedSelect.parameters)
+    let row = try #require(selected.rows.first)
+    #expect(try row.decode("id", as: Int64.self) == generatedID)
+    #expect(try row.decode("token", as: String.self) == token)
 }
 
 private struct DBALConformanceColumns: Sendable {

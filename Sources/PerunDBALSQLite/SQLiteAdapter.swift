@@ -15,6 +15,23 @@ public struct SQLiteDialect: SQLDialect {
         return "?"
     }
 
+    public func renderColumnType(_ type: ColumnType) -> String {
+        // Exact `INTEGER PRIMARY KEY` is a rowid alias, so reserve that spelling for
+        // `renderGeneratedPrimaryKeyColumn` and keep ordinary primary keys non-generated.
+        switch type {
+        case .boolean: "BOOLEAN"
+        case .int32: "INT"
+        case .int64: "BIGINT"
+        case .double: "REAL"
+        case .text, .timestamp, .uuid: "TEXT"
+        case .blob: "BLOB"
+        }
+    }
+
+    public func renderGeneratedPrimaryKeyColumn(_ name: String) -> String {
+        "\(quoteIdentifier(name)) INTEGER PRIMARY KEY"
+    }
+
     public func paginationPlan(
         limit: Int,
         offset: Int?,

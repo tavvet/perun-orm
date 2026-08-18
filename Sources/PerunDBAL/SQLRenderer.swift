@@ -135,6 +135,45 @@ public struct SQLDelete: Sendable, Hashable {
     }
 }
 
+public enum SQLColumnRole: Sendable, Hashable {
+    case attribute
+    case primaryKey(generated: Bool)
+}
+
+/// One portable column definition in a CREATE TABLE statement.
+public struct SQLColumnDefinition: Sendable, Hashable {
+    public let name: String
+    public let type: ColumnType
+    public let isNullable: Bool
+    public let isUnique: Bool
+    public let role: SQLColumnRole
+
+    public init(
+        name: String,
+        type: ColumnType,
+        nullable: Bool = false,
+        unique: Bool = false,
+        role: SQLColumnRole = .attribute
+    ) {
+        self.name = name
+        self.type = type
+        isNullable = nullable
+        isUnique = unique
+        self.role = role
+    }
+}
+
+/// A portable CREATE TABLE with column-level constraints only.
+public struct SQLCreateTable: Sendable, Hashable {
+    public let table: String
+    public let columns: [SQLColumnDefinition]
+
+    public init(table: String, columns: [SQLColumnDefinition]) {
+        self.table = table
+        self.columns = columns
+    }
+}
+
 public enum SQLRenderError: Error, Sendable, Equatable {
     case emptyTable
     case noSelectedColumns
@@ -148,6 +187,11 @@ public enum SQLRenderError: Error, Sendable, Equatable {
     case noUpdatedColumns
     case duplicateUpdateColumn(String)
     case returningUnsupported
+    case noTableColumns
+    case duplicateTableColumn(String)
+    case multiplePrimaryKeys
+    case nullablePrimaryKey(String)
+    case generatedPrimaryKeyRequiresInt64(column: String, actual: ColumnType)
 }
 
 /// Pure renderer: it never executes SQL and owns no mutable state between calls.
@@ -309,6 +353,66 @@ public struct SQLRenderer: Sendable {
         }
 
         return RenderedSQL(sql: sql, parameters: binder.parameters)
+    }
+
+    public func render(_ createTable: SQLCreateTable) throws -> RenderedSQL {
+        try validateTable(createTable.table)
+        guard !createTable.columns.isEmpty else {
+            throw SQLRenderError.noTableColumns
+        }
+
+        var columnNames: Set<String> = []
+        var primaryKeyCount = 0
+        for column in createTable.columns {
+            try validateColumn(column.name)
+            guard columnNames.insert(column.name.lowercased()).inserted else {
+                throw SQLRenderError.duplicateTableColumn(column.name)
+            }
+            guard case let .primaryKey(generated) = column.role else { continue }
+            primaryKeyCount += 1
+            guard primaryKeyCount == 1 else {
+                throw SQLRenderError.multiplePrimaryKeys
+            }
+            guard !column.isNullable else {
+                throw SQLRenderError.nullablePrimaryKey(column.name)
+            }
+            if generated, column.type != .int64 {
+                throw SQLRenderError.generatedPrimaryKeyRequiresInt64(
+                    column: column.name,
+                    actual: column.type
+                )
+            }
+        }
+
+        let columns = createTable.columns.map(renderColumnDefinition)
+        let sql = "CREATE TABLE \(dialect.quoteIdentifier(createTable.table)) "
+            + "(\(columns.joined(separator: ", ")))"
+        return RenderedSQL(sql: sql, parameters: [])
+    }
+
+    private func renderColumnDefinition(_ column: SQLColumnDefinition) -> String {
+        if case .primaryKey(generated: true) = column.role {
+            var sql = dialect.renderGeneratedPrimaryKeyColumn(column.name)
+            if column.isUnique {
+                sql += " UNIQUE"
+            }
+            return sql
+        }
+
+        var fragments = [
+            dialect.quoteIdentifier(column.name),
+            dialect.renderColumnType(column.type),
+        ]
+        if !column.isNullable {
+            fragments.append("NOT NULL")
+        }
+        if case .primaryKey = column.role {
+            fragments.append("PRIMARY KEY")
+        }
+        if column.isUnique {
+            fragments.append("UNIQUE")
+        }
+        return fragments.joined(separator: " ")
     }
 
     private func returningPlan(
