@@ -70,6 +70,34 @@ public struct SQLSelect: Sendable, Hashable {
     }
 }
 
+/// One target column and its bound value in an INSERT statement.
+public struct SQLColumnValue: Sendable, Hashable {
+    public let column: String
+    public let value: SQLValue
+
+    public init(column: String, value: SQLValue) {
+        self.column = column
+        self.value = value
+    }
+}
+
+/// A single-row INSERT. An empty value list renders as `DEFAULT VALUES`.
+public struct SQLInsert: Sendable, Hashable {
+    public let table: String
+    public let values: [SQLColumnValue]
+    public let returning: [String]
+
+    public init(
+        table: String,
+        values: [SQLColumnValue],
+        returning: [String] = []
+    ) {
+        self.table = table
+        self.values = values
+        self.returning = returning
+    }
+}
+
 public enum SQLRenderError: Error, Sendable, Equatable {
     case emptyTable
     case noSelectedColumns
@@ -79,6 +107,8 @@ public enum SQLRenderError: Error, Sendable, Equatable {
     case negativeLimit(Int)
     case negativeOffset(Int)
     case offsetRequiresLimit
+    case duplicateInsertColumn(String)
+    case returningUnsupported
 }
 
 /// Pure renderer: it never executes SQL and owns no mutable state between calls.
@@ -133,6 +163,71 @@ public struct SQLRenderer: Sendable {
         }
 
         return RenderedSQL(sql: sql, parameters: binder.parameters)
+    }
+
+    public func render(_ insert: SQLInsert) throws -> RenderedSQL {
+        try validateTable(insert.table)
+
+        var insertedColumns: Set<String> = []
+        for value in insert.values {
+            try validateColumn(value.column)
+            guard insertedColumns.insert(value.column.lowercased()).inserted else {
+                throw SQLRenderError.duplicateInsertColumn(value.column)
+            }
+        }
+        try insert.returning.forEach(validateColumn)
+
+        let returningPlan: SQLInsertReturningPlan?
+        if insert.returning.isEmpty {
+            returningPlan = nil
+        } else {
+            guard dialect.capabilities.contains(.returning),
+                  let plan = try dialect.insertReturningPlan(columns: insert.returning)
+            else {
+                throw SQLRenderError.returningUnsupported
+            }
+            returningPlan = plan
+        }
+
+        var binder = ParamBinder(dialect: dialect)
+        var sql = "INSERT INTO \(dialect.quoteIdentifier(insert.table))"
+
+        if !insert.values.isEmpty {
+            let columns = insert.values
+                .map { dialect.quoteIdentifier($0.column) }
+                .joined(separator: ", ")
+            sql += " (\(columns))"
+        }
+
+        if let returningPlan, returningPlan.placement == .beforeValues {
+            sql += " " + render(returningPlan)
+        }
+
+        if insert.values.isEmpty {
+            sql += " DEFAULT VALUES"
+        } else {
+            let placeholders = insert.values
+                .map { binder.bind($0.value) }
+                .joined(separator: ", ")
+            sql += " VALUES (\(placeholders))"
+        }
+
+        if let returningPlan, returningPlan.placement == .suffix {
+            sql += " " + render(returningPlan)
+        }
+
+        return RenderedSQL(sql: sql, parameters: binder.parameters)
+    }
+
+    private func render(_ returning: SQLInsertReturningPlan) -> String {
+        returning.fragments.map { fragment in
+            switch fragment {
+            case let .literal(sql):
+                sql
+            case let .column(column):
+                dialect.quoteIdentifier(column)
+            }
+        }.joined()
     }
 
     private func render(

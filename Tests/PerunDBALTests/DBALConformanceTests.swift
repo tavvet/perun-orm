@@ -51,6 +51,14 @@ private func runSharedDBALConformance(
         try await assertAffectedRowsAndTransactions(
             database: database,
             dialect: dialect,
+            tableName: tableName,
+            table: table,
+            columns: columns
+        )
+        try await assertReturningCapability(
+            database: database,
+            dialect: dialect,
+            tableName: tableName,
             table: table,
             columns: columns
         )
@@ -103,10 +111,13 @@ private func assertPortableRoundTrip(
         values: values
     )
 
-    let insert = try await database.execute(
-        insertSQL(dialect: dialect, table: table, columns: columns),
-        values.parameters
+    let renderedInsert = try renderInsert(
+        dialect: dialect,
+        tableName: tableName,
+        columns: columns,
+        values: values
     )
+    let insert = try await database.execute(renderedInsert.sql, renderedInsert.parameters)
     #expect(insert.rowsAffected == 1)
     #expect(insert.rows.isEmpty)
     #expect(insert.lastInsertRowID == nil)
@@ -191,6 +202,7 @@ private func assertContextFreeTypedParameterRoundTrip(
 private func assertAffectedRowsAndTransactions(
     database: any Database,
     dialect: any SQLDialect,
+    tableName: String,
     table: String,
     columns: DBALConformanceColumns
 ) async throws {
@@ -201,10 +213,18 @@ private func assertAffectedRowsAndTransactions(
     let missing = try await database.execute(updateSQL, [.text("missing"), .int(404)])
     #expect(missing.rowsAffected == 0)
 
-    let insert = insertSQL(dialect: dialect, table: table, columns: columns)
     let committedValues = try DBALConformanceValues.make(id: 2, name: "committed")
+    let committedInsert = try renderInsert(
+        dialect: dialect,
+        tableName: tableName,
+        columns: columns,
+        values: committedValues
+    )
     let committedName = try await database.withTransaction { transaction in
-        let result = try await transaction.execute(insert, committedValues.parameters)
+        let result = try await transaction.execute(
+            committedInsert.sql,
+            committedInsert.parameters
+        )
         #expect(result.rowsAffected == 1)
         let selected = try await transaction.execute(
             "SELECT \(columns.name) FROM \(table) WHERE \(columns.id) = \(dialect.placeholder(at: 1))",
@@ -216,9 +236,18 @@ private func assertAffectedRowsAndTransactions(
     #expect(committedName == committedValues.name)
 
     let rolledBackValues = try DBALConformanceValues.make(id: 3, name: "rolled back")
+    let rolledBackInsert = try renderInsert(
+        dialect: dialect,
+        tableName: tableName,
+        columns: columns,
+        values: rolledBackValues
+    )
     do {
         let _: Void = try await database.withTransaction { transaction in
-            _ = try await transaction.execute(insert, rolledBackValues.parameters)
+            _ = try await transaction.execute(
+                rolledBackInsert.sql,
+                rolledBackInsert.parameters
+            )
             throw DBALConformanceRollback.expected
         }
         Issue.record("transaction unexpectedly committed")
@@ -238,15 +267,53 @@ private func assertAffectedRowsAndTransactions(
     #expect(deletedAgain.rowsAffected == 0)
 }
 
-private func insertSQL(
+private func renderInsert(
     dialect: any SQLDialect,
+    tableName: String,
+    columns: DBALConformanceColumns,
+    values: DBALConformanceValues,
+    returning: [String] = []
+) throws -> RenderedSQL {
+    let columnNames = columns.names
+    let parameters = values.parameters
+    try #require(columnNames.count == parameters.count)
+    let columnValues = zip(columnNames, parameters).map { column, value in
+        SQLColumnValue(column: column, value: value)
+    }
+    return try SQLRenderer(dialect: dialect).render(
+        SQLInsert(table: tableName, values: columnValues, returning: returning)
+    )
+}
+
+private func assertReturningCapability(
+    database: any Database,
+    dialect: any SQLDialect,
+    tableName: String,
     table: String,
     columns: DBALConformanceColumns
-) -> String {
-    let placeholders = (1 ... columns.count)
-        .map { dialect.placeholder(at: $0) }
-        .joined(separator: ", ")
-    return "INSERT INTO \(table) (\(columns.list)) VALUES (\(placeholders))"
+) async throws {
+    guard dialect.capabilities.contains(.returning) else { return }
+
+    let values = try DBALConformanceValues.make(id: 4, name: "returned")
+    let rendered = try renderInsert(
+        dialect: dialect,
+        tableName: tableName,
+        columns: columns,
+        values: values,
+        returning: ["id", "name"]
+    )
+    let result = try await database.execute(rendered.sql, rendered.parameters)
+    #expect(result.rowsAffected == 1)
+    #expect(result.rows.count == 1)
+    #expect(result.lastInsertRowID == nil)
+
+    let row = try #require(result.rows.first)
+    #expect(try row.decode("id", as: Int64.self) == values.id)
+    #expect(try row.decode("name", as: String.self) == values.name)
+
+    let deleteSQL = "DELETE FROM \(table) WHERE \(columns.id) = \(dialect.placeholder(at: 1))"
+    let deleted = try await database.execute(deleteSQL, [.int(values.id)])
+    #expect(deleted.rowsAffected == 1)
 }
 
 private struct DBALConformanceSchema: Sendable {
@@ -333,7 +400,6 @@ private struct DBALConformanceColumns: Sendable {
         ["id", "flag", "small", "large", "score", "name", "payload", "created_at", "token", "absent"]
     }
 
-    var count: Int { 10 }
 }
 
 private struct DBALConformanceValues: Sendable {

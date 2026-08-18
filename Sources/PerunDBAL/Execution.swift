@@ -116,6 +116,36 @@ public struct SQLPaginationPlan: Sendable, Hashable {
     }
 }
 
+/// Where a dialect emits a row-returning clause for INSERT.
+public enum SQLInsertReturningPlacement: Sendable, Hashable {
+    /// Between the target column list and the value source, as in SQL Server `OUTPUT`.
+    case beforeValues
+    /// After the value source, as in PostgreSQL `RETURNING`.
+    case suffix
+}
+
+/// One lexical fragment of a dialect-owned INSERT row-returning clause.
+public enum SQLInsertReturningFragment: Sendable, Hashable {
+    /// Backend-owned SQL emitted verbatim.
+    case literal(String)
+    /// One requested column, quoted by the renderer's dialect.
+    case column(String)
+}
+
+/// A backend-specific INSERT row-returning clause.
+public struct SQLInsertReturningPlan: Sendable, Hashable {
+    public let placement: SQLInsertReturningPlacement
+    public let fragments: [SQLInsertReturningFragment]
+
+    public init(
+        placement: SQLInsertReturningPlacement,
+        fragments: [SQLInsertReturningFragment]
+    ) {
+        self.placement = placement
+        self.fragments = fragments
+    }
+}
+
 /// The rendering policy supplied by a concrete backend adapter.
 public protocol SQLDialect: Sendable {
     var capabilities: DialectCapabilities { get }
@@ -127,6 +157,7 @@ public protocol SQLDialect: Sendable {
         offset: Int?,
         context: SQLPaginationContext
     ) throws -> SQLPaginationPlan
+    func insertReturningPlan(columns: [String]) throws -> SQLInsertReturningPlan?
 }
 
 public extension SQLDialect {
@@ -154,5 +185,10 @@ public extension SQLDialect {
             .literal(" ROWS ONLY"),
         ])
         return SQLPaginationPlan(placement: .suffix, fragments: fragments)
+    }
+
+    /// The standard default does not assume a backend-specific row-returning grammar.
+    func insertReturningPlan(columns: [String]) throws -> SQLInsertReturningPlan? {
+        nil
     }
 }

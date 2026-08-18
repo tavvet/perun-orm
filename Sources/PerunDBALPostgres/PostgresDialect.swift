@@ -33,4 +33,15 @@ public struct PostgresDialect: SQLDialect {
         }
         return SQLPaginationPlan(placement: .suffix, fragments: fragments)
     }
+
+    public func insertReturningPlan(columns: [String]) -> SQLInsertReturningPlan? {
+        var fragments: [SQLInsertReturningFragment] = [.literal("RETURNING ")]
+        for (index, column) in columns.enumerated() {
+            if index > 0 {
+                fragments.append(.literal(", "))
+            }
+            fragments.append(.column(column))
+        }
+        return SQLInsertReturningPlan(placement: .suffix, fragments: fragments)
+    }
 }
