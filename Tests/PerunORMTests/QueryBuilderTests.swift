@@ -182,6 +182,35 @@ func queryBuilderLeavesPaginationValidationToTheDialectRenderer() throws {
     }
 }
 
+@Test
+func queryDerivesFirstAndCountExecutionShapesWithoutChangingTheBaseQuery() throws {
+    let active = try Predicate<QueryRecord>.eq(\QueryRecord.isActive, true)
+    let query = try Query(QueryRecord.self)
+        .where(active)
+        .order(by: \QueryRecord.id, desc: true)
+        .limit(25, offset: 50)
+
+    #expect(
+        query.firstQuery.statement == SQLSelect(
+            table: "query\"records",
+            columns: ["id", "name", "nickname", "score", "is_active"],
+            predicate: active.core,
+            orderings: [SQLOrdering(column: "id", direction: .descending)],
+            limit: 1,
+            offset: 50
+        )
+    )
+    #expect(
+        query.countStatement == SQLCount(
+            table: "query\"records",
+            predicate: active.core
+        )
+    )
+    #expect(query.statement.limit == 25)
+    #expect(query.limit(0, offset: 2).firstQuery.statement.limit == 0)
+    #expect(query.limit(-1).firstQuery.statement.limit == -1)
+}
+
 private func requireSendable<Value: Sendable>(_ value: Value) {}
 
 private struct QueryRecord: Entity {

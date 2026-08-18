@@ -198,6 +198,53 @@ func selectRendererRejectsStructurallyInvalidStatements() {
     }
 }
 
+@Test
+func countRendererQuotesIdentifiersAndBindsThePredicate() throws {
+    let count = SQLCount(
+        table: "user\"records",
+        predicate: .and([
+            .comparison(column: "is_active", op: .eq, value: .bool(true)),
+            .inList(column: "nickname", values: [.text("one"), .null]),
+        ])
+    )
+
+    let postgres = try SQLRenderer(dialect: PostgresDialect()).render(count)
+    #expect(
+        postgres == RenderedSQL(
+            sql: "SELECT COUNT(*) AS \"count\" FROM \"user\"\"records\" WHERE (\"is_active\" = $1 AND (\"nickname\" IN ($2) OR \"nickname\" IS NULL))",
+            parameters: [.bool(true), .text("one")]
+        )
+    )
+
+    let sqlite = try SQLRenderer(dialect: SQLiteDialect()).render(count)
+    #expect(
+        sqlite == RenderedSQL(
+            sql: "SELECT COUNT(*) AS \"count\" FROM \"user\"\"records\" WHERE (\"is_active\" = ? AND (\"nickname\" IN (?) OR \"nickname\" IS NULL))",
+            parameters: postgres.parameters
+        )
+    )
+}
+
+@Test
+func countRendererRejectsInvalidTableAndPredicateIdentifiers() {
+    let renderer = SQLRenderer(dialect: SQLiteDialect())
+
+    #expect(throws: SQLRenderError.emptyTable) {
+        try renderer.render(SQLCount(table: ""))
+    }
+    #expect(throws: SQLRenderError.identifierContainsNullByte) {
+        try renderer.render(SQLCount(table: "samples\0hidden"))
+    }
+    #expect(throws: SQLRenderError.emptyColumn) {
+        try renderer.render(
+            SQLCount(
+                table: "samples",
+                predicate: .comparison(column: "", op: .eq, value: .int(1))
+            )
+        )
+    }
+}
+
 private struct StandardDialect: SQLDialect {
     let capabilities: DialectCapabilities = []
 

@@ -223,6 +223,168 @@ func swallowedFetchExecutorFailureForcesTheUnitOfWorkToRollBack() async throws {
     #expect(await state.calls.map(\.scope) == [.transaction])
 }
 
+@Test
+func sessionFirstTightensTheLimitAndRefreshesItsIdentitySnapshot() async throws {
+    let first = FetchRecord(id: 13, name: "first", nickname: nil, isActive: true)
+    let state = FetchDatabaseState(directResponses: [
+        .result(ExecResult(rows: [fetchRow(first)])),
+        .result(ExecResult(rows: [])),
+    ])
+    let session = Session(database: FetchDatabase(state: state))
+    let active = try Predicate<FetchRecord>.eq(\FetchRecord.isActive, true)
+    let query = try Query(FetchRecord.self)
+        .where(active)
+        .order(by: \FetchRecord.id, desc: true)
+        .limit(5, offset: 2)
+
+    #expect(try await session.first(query) == first)
+    #expect(try await session.find(FetchRecord.self, first.id) == first)
+    #expect(try await session.first(Query(FetchRecord.self).limit(0)) == nil)
+    #expect(await state.calls == [
+        FetchDatabaseCall(
+            scope: .direct,
+            sql: "SELECT \"id\", \"name\", \"nickname\", \"is_active\" FROM \"fetch\"\"records\" WHERE \"is_active\" = ? ORDER BY \"id\" DESC LIMIT ? OFFSET ?",
+            parameters: [.bool(true), .int(1), .int(2)]
+        ),
+        FetchDatabaseCall(
+            scope: .direct,
+            sql: "SELECT \"id\", \"name\", \"nickname\", \"is_active\" FROM \"fetch\"\"records\" LIMIT ?",
+            parameters: [.int(0)]
+        ),
+    ])
+}
+
+@Test
+func unitOfWorkFirstStagesAndPromotesItsSnapshot() async throws {
+    let first = FetchRecord(id: 14, name: "transactional", nickname: "first", isActive: true)
+    let state = FetchDatabaseState(
+        transactionResponses: [.result(ExecResult(rows: [fetchRow(first)]))]
+    )
+    let session = Session(database: FetchDatabase(state: state))
+    let query = try Query(FetchRecord.self).order(by: \FetchRecord.id)
+
+    let returned = try await session.withUnitOfWork { unitOfWork in
+        let returned = try await unitOfWork.first(query)
+        #expect(try await unitOfWork.find(FetchRecord.self, first.id) == first)
+        return returned
+    }
+
+    #expect(returned == first)
+    #expect(try await session.find(FetchRecord.self, first.id) == first)
+    #expect(await state.commits == 1)
+    #expect(await state.calls == [
+        FetchDatabaseCall(
+            scope: .transaction,
+            sql: "SELECT \"id\", \"name\", \"nickname\", \"is_active\" FROM \"fetch\"\"records\" ORDER BY \"id\" ASC LIMIT ?",
+            parameters: [.int(1)]
+        ),
+    ])
+}
+
+@Test
+func sessionCountIgnoresOrderingAndPaginationWithoutChangingIdentity() async throws {
+    let cached = FetchRecord(id: 15, name: "cached", nickname: nil, isActive: true)
+    let state = FetchDatabaseState(directResponses: [
+        .result(ExecResult(rows: [fetchRow(cached)])),
+        .result(ExecResult(rows: [countRow(2)])),
+    ])
+    let session = Session(database: FetchDatabase(state: state))
+    #expect(try await session.find(FetchRecord.self, cached.id) == cached)
+
+    let active = try Predicate<FetchRecord>.eq(\FetchRecord.isActive, true)
+    let query = try Query(FetchRecord.self)
+        .where(active)
+        .order(by: \FetchRecord.name, desc: true)
+        .limit(1, offset: 7)
+
+    #expect(try await session.count(query) == 2)
+    #expect(try await session.find(FetchRecord.self, cached.id) == cached)
+    #expect(await state.calls == [
+        FetchDatabaseCall(
+            scope: .direct,
+            sql: "SELECT \"id\", \"name\", \"nickname\", \"is_active\" FROM \"fetch\"\"records\" WHERE \"id\" = ? LIMIT ?",
+            parameters: [.int(cached.id), .int(2)]
+        ),
+        FetchDatabaseCall(
+            scope: .direct,
+            sql: "SELECT COUNT(*) AS \"count\" FROM \"fetch\"\"records\" WHERE \"is_active\" = ?",
+            parameters: [.bool(true)]
+        ),
+    ])
+}
+
+@Test
+func unitOfWorkCountResultErrorsAreRecoverable() async throws {
+    let malformed = FetchRow(values: ["wrong": .int(3)])
+    let state = FetchDatabaseState(transactionResponses: [
+        .result(ExecResult(rows: [])),
+        .result(ExecResult(rows: [countRow(1), countRow(1)])),
+        .result(ExecResult(rows: [malformed])),
+        .result(ExecResult(rows: [countRow(4)])),
+    ])
+    let session = Session(database: FetchDatabase(state: state))
+    let query = try Query(FetchRecord.self)
+
+    try await session.withUnitOfWork { unitOfWork in
+        for actual in [0, 2] {
+            do {
+                _ = try await unitOfWork.count(query)
+                Issue.record("count accepted \(actual) result rows")
+            } catch let error as ORMError {
+                #expect(
+                    error == .unexpectedCountResultRowCount(
+                        table: "fetch\"records",
+                        actual: actual
+                    )
+                )
+            }
+        }
+
+        do {
+            _ = try await unitOfWork.count(query)
+            Issue.record("count accepted a row without its result column")
+        } catch let error as FetchTestError {
+            #expect(error == .missingColumn(SQLCount.resultColumn))
+        }
+
+        #expect(try await unitOfWork.count(query) == 4)
+    }
+
+    #expect(await state.commits == 1)
+    #expect(await state.calls.map(\.scope) == [
+        .transaction,
+        .transaction,
+        .transaction,
+        .transaction,
+    ])
+}
+
+@Test
+func swallowedCountExecutorFailureForcesTheUnitOfWorkToRollBack() async throws {
+    let state = FetchDatabaseState(
+        transactionResponses: [.failure(.executorFailed)]
+    )
+    let session = Session(database: FetchDatabase(state: state))
+    let query = try Query(FetchRecord.self)
+
+    do {
+        let _: Void = try await session.withUnitOfWork { unitOfWork in
+            do {
+                _ = try await unitOfWork.count(query)
+                Issue.record("count ignored an executor failure")
+            } catch let error as FetchTestError {
+                #expect(error == .executorFailed)
+            }
+        }
+        Issue.record("unit of work committed after a swallowed count failure")
+    } catch let error as SessionError {
+        #expect(error == .unitOfWorkRollbackOnly)
+    }
+
+    #expect(await state.commits == 0)
+    #expect(await state.calls.map(\.scope) == [.transaction])
+}
+
 private struct FetchRecord: Entity, Equatable {
     typealias PK = Int64
 
@@ -267,6 +429,10 @@ private func fetchRow(_ record: FetchRecord) -> FetchRow {
         "nickname": record.nickname.map(SQLValue.text) ?? .null,
         "is_active": .bool(record.isActive),
     ])
+}
+
+private func countRow(_ count: Int64) -> FetchRow {
+    FetchRow(values: [SQLCount.resultColumn: .int(count)])
 }
 
 private struct FetchDatabaseCall: Sendable, Equatable {

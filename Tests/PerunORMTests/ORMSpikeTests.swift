@@ -81,6 +81,20 @@ func unitOfWorkOwnsTheTransactionAndClosesAfterTheBody() async throws {
             #expect(error == .sessionBusy)
         }
 
+        do {
+            _ = try await session.first(query)
+            Issue.record("session first unexpectedly entered an active unit of work")
+        } catch let error as SessionError {
+            #expect(error == .sessionBusy)
+        }
+
+        do {
+            _ = try await session.count(query)
+            Issue.record("session count unexpectedly entered an active unit of work")
+        } catch let error as SessionError {
+            #expect(error == .sessionBusy)
+        }
+
         return unitOfWork
     }
 

@@ -525,6 +525,8 @@ private func runSharedORMQueryConformance(database: any Database) async throws {
 
         let session = Session(database: database)
         #expect(try await session.fetch(limitedQuery) == [third])
+        #expect(try await session.first(limitedQuery) == third)
+        #expect(try await session.count(limitedQuery) == 2)
         #expect(try await session.find(ORMQueryRecord.self, third.id) == third)
 
         let refreshedThird = ORMQueryRecord(
@@ -584,6 +586,8 @@ private func runSharedORMQueryConformance(database: any Database) async throws {
 
             let rows = try await unitOfWork.fetch(allQuery)
             #expect(rows == [updatedFirst, refreshedThird, fourth])
+            #expect(try await unitOfWork.first(allQuery) == updatedFirst)
+            #expect(try await unitOfWork.count(allQuery.limit(1, offset: 1)) == 3)
             #expect(try await unitOfWork.find(ORMQueryRecord.self, first.id) == updatedFirst)
             #expect(try await unitOfWork.find(ORMQueryRecord.self, second.id) == nil)
             #expect(try await unitOfWork.find(ORMQueryRecord.self, fourth.id) == fourth)
@@ -599,6 +603,7 @@ private func runSharedORMQueryConformance(database: any Database) async throws {
             try await freshSession.fetch(allQuery)
                 == [updatedFirst, refreshedThird, fourth]
         )
+        #expect(try await freshSession.count(allQuery.limit(0)) == 3)
 
         _ = try await database.execute(dropSQL, [])
     } catch {

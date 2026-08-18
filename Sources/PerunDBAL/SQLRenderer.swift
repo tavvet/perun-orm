@@ -70,6 +70,19 @@ public struct SQLSelect: Sendable, Hashable {
     }
 }
 
+/// A filtered `COUNT(*)` query. Ordering and pagination are intentionally not represented.
+public struct SQLCount: Sendable, Hashable {
+    public static let resultColumn = "count"
+
+    public let table: String
+    public let predicate: SQLPredicate?
+
+    public init(table: String, predicate: SQLPredicate? = nil) {
+        self.table = table
+        self.predicate = predicate
+    }
+}
+
 /// One target column and its bound value in a DML statement.
 public struct SQLColumnValue: Sendable, Hashable {
     public let column: String
@@ -245,6 +258,18 @@ public struct SQLRenderer: Sendable {
             sql += " " + render(pagination, binder: &binder)
         }
 
+        return RenderedSQL(sql: sql, parameters: binder.parameters)
+    }
+
+    public func render(_ count: SQLCount) throws -> RenderedSQL {
+        try validateTable(count.table)
+
+        var binder = ParamBinder(dialect: dialect)
+        var sql = "SELECT COUNT(*) AS \(dialect.quoteIdentifier(SQLCount.resultColumn)) "
+            + "FROM \(dialect.quoteIdentifier(count.table))"
+        if let predicate = count.predicate {
+            sql += " WHERE \(try render(predicate, binder: &binder))"
+        }
         return RenderedSQL(sql: sql, parameters: binder.parameters)
     }
 

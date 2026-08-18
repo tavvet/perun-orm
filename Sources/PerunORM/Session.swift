@@ -38,6 +38,7 @@ public enum ORMError: Error, Sendable, Equatable {
     case unexpectedInsertResultRowCount(table: String, actual: Int)
     case generatedPrimaryKeyUnavailable(table: String)
     case insertedRowLookupCount(table: String, primaryKey: SQLValue, actual: Int)
+    case unexpectedCountResultRowCount(table: String, actual: Int)
 }
 
 fileprivate struct EntityKey: Sendable, Hashable {
@@ -54,6 +55,11 @@ fileprivate struct EntityFindPlan<E: Entity>: Sendable {
 
 fileprivate struct EntityFetchPlan: Sendable {
     let statement: SQLSelect
+}
+
+fileprivate struct EntityCountPlan: Sendable {
+    let tableName: String
+    let statement: SQLCount
 }
 
 fileprivate struct ManagedEntitySnapshot: Sendable {
@@ -179,6 +185,22 @@ public actor Session {
             identity[key] = snapshot
         }
         return batch.entities
+    }
+
+    /// Executes at most one row of a typed SELECT and refreshes its identity snapshot.
+    public func first<E: Entity>(_ query: Query<E>) async throws -> E? {
+        try await fetch(query.firstQuery).first
+    }
+
+    /// Counts every row matching the typed predicate, before ordering or pagination.
+    public func count<E: Entity>(_ query: Query<E>) async throws -> Int64 {
+        try beginDirectDatabaseOperation()
+        defer { endDirectDatabaseOperation() }
+
+        let schema = try validatedSchema(for: E.self)
+        let rendered = try SQLRenderer(dialect: database.dialect).render(query.countStatement)
+        let result = try await database.execute(rendered.sql, rendered.parameters)
+        return try decodeCount(result, table: schema.tableName)
     }
 
     public func withUnitOfWork<T: Sendable>(
@@ -314,6 +336,18 @@ public actor Session {
         try validateUnitOfWork(token)
         let schema = try validatedSchema(for: type)
         return try hydrate(rows, schema: schema)
+    }
+
+    fileprivate func unitOfWorkCountPlan<E: Entity>(
+        for query: Query<E>,
+        token: UUID
+    ) throws -> EntityCountPlan {
+        try validateUnitOfWork(token)
+        let schema = try validatedSchema(for: E.self)
+        return EntityCountPlan(
+            tableName: schema.tableName,
+            statement: query.countStatement
+        )
     }
 
     fileprivate func unitOfWorkInsertPlan<E: Entity>(
@@ -641,6 +675,22 @@ public actor UnitOfWork {
             overlay[key] = .snapshot(snapshot)
         }
         return batch.entities
+    }
+
+    /// Executes at most one transactional row and stages its identity snapshot.
+    public func first<E: Entity>(_ query: Query<E>) async throws -> E? {
+        try await fetch(query.firstQuery).first
+    }
+
+    /// Counts every transactional row matching the typed predicate before pagination.
+    public func count<E: Entity>(_ query: Query<E>) async throws -> Int64 {
+        try beginOperation()
+        defer { endOperation() }
+
+        let plan = try await session.unitOfWorkCountPlan(for: query, token: token)
+        let rendered = try SQLRenderer(dialect: dialect).render(plan.statement)
+        let result = try await executeTransaction(rendered.sql, rendered.parameters)
+        return try decodeCount(result, table: plan.tableName)
     }
 
     /// Inserts one entity eagerly and returns the snapshot carrying its final primary key.
@@ -1010,6 +1060,16 @@ public actor UnitOfWork {
             waiter.resume()
         }
     }
+}
+
+private func decodeCount(_ result: ExecResult, table: String) throws -> Int64 {
+    guard result.rows.count == 1, let row = result.rows.first else {
+        throw ORMError.unexpectedCountResultRowCount(
+            table: table,
+            actual: result.rows.count
+        )
+    }
+    return try row.decode(SQLCount.resultColumn, as: Int64.self)
 }
 
 private func transactionControlCommand(in sql: String) -> String? {

@@ -211,6 +211,24 @@ public struct Query<E: Entity>: Sendable, Hashable {
             )
         )
     }
+
+    var firstQuery: Self {
+        let limit = statement.limit.map { Swift.min($0, 1) } ?? 1
+        return Self(
+            statement: SQLSelect(
+                table: statement.table,
+                columns: statement.columns,
+                predicate: statement.predicate,
+                orderings: statement.orderings,
+                limit: limit,
+                offset: statement.offset
+            )
+        )
+    }
+
+    var countStatement: SQLCount {
+        SQLCount(table: statement.table, predicate: statement.predicate)
+    }
 }
 
 private func queryColumn<E: Entity, Value>(
