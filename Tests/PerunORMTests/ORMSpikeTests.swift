@@ -66,6 +66,13 @@ func unitOfWorkOwnsTheTransactionAndClosesAfterTheBody() async throws {
             #expect(error == .sessionBusy)
         }
 
+        do {
+            _ = try await session.find(User.self, 1)
+            Issue.record("session find unexpectedly entered an active unit of work")
+        } catch let error as SessionError {
+            #expect(error == .sessionBusy)
+        }
+
         return unitOfWork
     }
 
@@ -136,6 +143,29 @@ func unitOfWorkCannotStartWhileADirectSessionOperationIsInFlight() async throws 
 
     await gate.release()
     _ = try await directOperation.value
+    #expect(await recorder.statements == ["direct-start", "direct-finish"])
+}
+
+@Test
+func unitOfWorkCannotStartWhileSessionFindIsInFlight() async throws {
+    let gate = OperationGate()
+    let recorder = Recorder()
+    let session = Session(database: GatedDatabase(gate: gate, recorder: recorder))
+    let findOperation = Task {
+        try await session.find(User.self, 1)
+    }
+
+    await gate.waitUntilStarted()
+    do {
+        let _: Void = try await session.withUnitOfWork { _ in }
+        Issue.record("unit of work unexpectedly overlapped session find")
+    } catch let error as SessionError {
+        #expect(error == .sessionBusy)
+    }
+
+    await gate.release()
+    let found = try await findOperation.value
+    #expect(found == nil)
     #expect(await recorder.statements == ["direct-start", "direct-finish"])
 }
 

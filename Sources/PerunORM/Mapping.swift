@@ -131,3 +131,44 @@ public struct EntitySchema<E: Entity> {
         self.primaryKey = primaryKey
     }
 }
+
+extension EntitySchema {
+    var createTableStatement: SQLCreateTable {
+        SQLCreateTable(
+            table: tableName,
+            columns: fields.map { field in
+                SQLColumnDefinition(
+                    name: field.column,
+                    type: field.type,
+                    nullable: field.isNullable,
+                    unique: field.isUnique,
+                    role: field.role.sqlRole
+                )
+            }
+        )
+    }
+
+    func findStatement(primaryKey: E.PK) -> SQLSelect {
+        SQLSelect(
+            table: tableName,
+            columns: fields.map(\.column),
+            predicate: .comparison(
+                column: self.primaryKey.column,
+                op: .eq,
+                value: primaryKey.sqlValue
+            ),
+            limit: 2
+        )
+    }
+}
+
+private extension ColumnRole {
+    var sqlRole: SQLColumnRole {
+        switch self {
+        case .attribute:
+            .attribute
+        case let .primaryKey(generated):
+            .primaryKey(generated: generated)
+        }
+    }
+}

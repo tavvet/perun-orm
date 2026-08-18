@@ -54,7 +54,14 @@ let package = Package(
         ),
         .testTarget(
             name: "PerunORMTests",
-            dependencies: ["PerunDBAL", "PerunORM"]
+            dependencies: [
+                "PerunDBAL",
+                "PerunDBALPostgres",
+                "PerunDBALSQLite",
+                "PerunORM",
+                .product(name: "PerunPGSQL", package: "perun-pgsql"),
+                .product(name: "PerunSQLite", package: "perun-sqlite"),
+            ]
         ),
     ],
     swiftLanguageModes: [.v6]
