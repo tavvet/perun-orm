@@ -58,6 +58,23 @@ func postgresPassesSharedORMUpdateConformance() async throws {
     )
 }
 
+@Test
+func sqlitePassesSharedORMDeleteConformance() async throws {
+    try await runSharedORMDeleteConformance(
+        database: SQLiteDatabase(configuration: .memory(), maxConnections: 1)
+    )
+}
+
+@Test(.enabled(if: ProcessInfo.processInfo.environment["PERUN_PGSQL_INTEGRATION"] == "1"))
+func postgresPassesSharedORMDeleteConformance() async throws {
+    try await runSharedORMDeleteConformance(
+        database: PostgresDatabase(
+            configuration: ormPostgresIntegrationConfiguration(),
+            maxConnections: 1
+        )
+    )
+}
+
 private func runSharedORMFindConformance(database: any Database) async throws {
     let dialect = database.dialect
     let renderer = SQLRenderer(dialect: dialect)
@@ -327,6 +344,102 @@ private func runSharedORMUpdateConformance(database: any Database) async throws 
     await database.shutdown()
 }
 
+private func runSharedORMDeleteConformance(database: any Database) async throws {
+    let dialect = database.dialect
+    let renderer = SQLRenderer(dialect: dialect)
+    let tableName = ORMDeleteRecord.tableName
+    let table = dialect.quoteIdentifier(tableName)
+    let dropSQL = "DROP TABLE IF EXISTS \(table)"
+
+    do {
+        _ = try await database.execute(dropSQL, [])
+
+        let schema = try EntitySchema(ORMDeleteRecord.self)
+        let createTable = try renderer.render(schema.createTableStatement)
+        _ = try await database.execute(createTable.sql, createTable.parameters)
+
+        let committed = ORMDeleteRecord(
+            id: 42,
+            name: "committed-delete",
+            nickname: nil,
+            isActive: true
+        )
+        let rolledBack = ORMDeleteRecord(
+            id: 43,
+            name: "rolled-back-delete",
+            nickname: "temporary",
+            isActive: false
+        )
+
+        for record in [committed, rolledBack] {
+            let insert = try renderer.render(
+                SQLInsert(
+                    table: tableName,
+                    values: [
+                        SQLColumnValue(column: "id", value: .int(record.id)),
+                        SQLColumnValue(column: "name", value: .text(record.name)),
+                        SQLColumnValue(
+                            column: "nickname",
+                            value: record.nickname.map(SQLValue.text) ?? .null
+                        ),
+                        SQLColumnValue(
+                            column: "is_active",
+                            value: .bool(record.isActive)
+                        ),
+                    ]
+                )
+            )
+            let result = try await database.execute(insert.sql, insert.parameters)
+            #expect(result.rowsAffected == 1)
+        }
+
+        let session = Session(database: database)
+        let managedCommitted = try #require(
+            await session.find(ORMDeleteRecord.self, committed.id)
+        )
+
+        try await session.withUnitOfWork { unitOfWork in
+            try await unitOfWork.delete(managedCommitted)
+            #expect(try await unitOfWork.find(ORMDeleteRecord.self, committed.id) == nil)
+        }
+
+        #expect(try await session.find(ORMDeleteRecord.self, committed.id) == nil)
+        let freshAfterCommit = Session(database: database)
+        #expect(try await freshAfterCommit.find(ORMDeleteRecord.self, committed.id) == nil)
+
+        let managedRolledBack = try #require(
+            await session.find(ORMDeleteRecord.self, rolledBack.id)
+        )
+        do {
+            let _: Void = try await session.withUnitOfWork { unitOfWork in
+                try await unitOfWork.delete(managedRolledBack)
+                #expect(
+                    try await unitOfWork.find(ORMDeleteRecord.self, rolledBack.id) == nil
+                )
+                throw ORMDeleteConformanceError.rollback
+            }
+            Issue.record("failing delete unit of work unexpectedly committed")
+        } catch let error as ORMDeleteConformanceError {
+            #expect(error == .rollback)
+        }
+
+        #expect(try await session.find(ORMDeleteRecord.self, rolledBack.id) == rolledBack)
+        let freshAfterRollback = Session(database: database)
+        #expect(
+            try await freshAfterRollback.find(ORMDeleteRecord.self, rolledBack.id)
+                == rolledBack
+        )
+
+        _ = try await database.execute(dropSQL, [])
+    } catch {
+        _ = try? await database.execute(dropSQL, [])
+        await database.shutdown()
+        throw error
+    }
+
+    await database.shutdown()
+}
+
 private struct ORMFindRecord: Entity, Equatable {
     typealias PK = Int64
 
@@ -441,6 +554,44 @@ private struct ORMUpdateRecord: Entity, Equatable {
     }
 }
 
+private struct ORMDeleteRecord: Entity, Equatable {
+    typealias PK = Int64
+
+    let id: Int64
+    let name: String
+    let nickname: String?
+    let isActive: Bool
+
+    static let tableName = "perun_orm_delete_"
+        + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+    static var fields: [FieldDescriptor<ORMDeleteRecord>] {
+        [
+            FieldDescriptor(
+                \ORMDeleteRecord.id,
+                column: "id",
+                role: .primaryKey(generated: false)
+            ),
+            FieldDescriptor(\ORMDeleteRecord.name, column: "name"),
+            FieldDescriptor(\ORMDeleteRecord.nickname, column: "nickname"),
+            FieldDescriptor(\ORMDeleteRecord.isActive, column: "is_active"),
+        ]
+    }
+
+    init(id: Int64, name: String, nickname: String?, isActive: Bool) {
+        self.id = id
+        self.name = name
+        self.nickname = nickname
+        self.isActive = isActive
+    }
+
+    init(row: any Row) throws {
+        id = try row.decode("id", as: Int64.self)
+        name = try row.decode("name", as: String.self)
+        nickname = try row.decode("nickname", as: String?.self)
+        isActive = try row.decode("is_active", as: Bool.self)
+    }
+}
+
 private actor ORMGeneratedIDBox {
     private(set) var value: Int64?
 
@@ -454,6 +605,10 @@ private enum ORMInsertConformanceError: Error, Sendable, Equatable {
 }
 
 private enum ORMUpdateConformanceError: Error, Sendable, Equatable {
+    case rollback
+}
+
+private enum ORMDeleteConformanceError: Error, Sendable, Equatable {
     case rollback
 }
 

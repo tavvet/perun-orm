@@ -302,6 +302,17 @@ extension EntitySchema {
         )
     }
 
+    func deleteStatement(primaryKey: SQLValue) -> SQLDelete {
+        SQLDelete(
+            table: tableName,
+            predicate: .comparison(
+                column: self.primaryKey.column,
+                op: .eq,
+                value: primaryKey
+            )
+        )
+    }
+
     func hasSameMappedValues(_ lhs: E, _ rhs: E) -> Bool {
         hasSameMappedValues(mappedValues(of: lhs), mappedValues(of: rhs))
     }

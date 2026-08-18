@@ -28,6 +28,11 @@ public enum ORMError: Error, Sendable, Equatable {
         primaryKey: SQLValue,
         actual: Int
     )
+    case unexpectedDeleteAffectedRowCount(
+        table: String,
+        primaryKey: SQLValue,
+        actual: Int
+    )
     case generatedPrimaryKeyRetrievalUnsupported(table: String)
     case unexpectedInsertAffectedRowCount(table: String, actual: Int?)
     case unexpectedInsertResultRowCount(table: String, actual: Int)
@@ -44,12 +49,18 @@ fileprivate struct EntityFindPlan<E: Entity>: Sendable {
     let tableName: String
     let statement: SQLSelect
     let cachedEntity: E?
+    let isDeleted: Bool
 }
 
 fileprivate struct ManagedEntitySnapshot: Sendable {
     let entityType: ObjectIdentifier
     let mappedValues: [SQLValue]
     let primaryKey: SQLValue
+}
+
+fileprivate enum ManagedEntityState: Sendable {
+    case snapshot(ManagedEntitySnapshot)
+    case deleted
 }
 
 fileprivate struct EntityInsertPlan: Sendable {
@@ -67,9 +78,15 @@ fileprivate struct EntityUpdatePlan: Sendable {
     let snapshot: ManagedEntitySnapshot
 }
 
+fileprivate struct EntityDeletePlan: Sendable {
+    let tableName: String
+    let statement: SQLDelete
+    let primaryKey: SQLValue
+}
+
 fileprivate struct UnitOfWorkChanges: Sendable {
     let invalidatesIdentity: Bool
-    let snapshots: [EntityKey: ManagedEntitySnapshot]
+    let entities: [EntityKey: ManagedEntityState]
 }
 
 private struct UnitOfWorkOutcome<Value: Sendable>: Sendable {
@@ -175,8 +192,13 @@ public actor Session {
         if outcome.changes.invalidatesIdentity {
             identity.removeAll(keepingCapacity: true)
         }
-        for (key, entity) in outcome.changes.snapshots {
-            identity[key] = entity
+        for (key, state) in outcome.changes.entities {
+            switch state {
+            case let .snapshot(snapshot):
+                identity[key] = snapshot
+            case .deleted:
+                identity.removeValue(forKey: key)
+            }
         }
         return outcome.value
     }
@@ -210,7 +232,7 @@ public actor Session {
     fileprivate func unitOfWorkFindPlan<E: Entity>(
         for type: E.Type,
         primaryKey: E.PK,
-        overlaySnapshot: ManagedEntitySnapshot?,
+        overlayState: ManagedEntityState?,
         useCachedEntity: Bool,
         token: UUID
     ) throws -> EntityFindPlan<E> {
@@ -219,7 +241,19 @@ public actor Session {
         let primaryKeyValue = primaryKey.sqlValue
         let key = EntityKey(type: ObjectIdentifier(type), primaryKey: primaryKeyValue)
         let cachedEntity: E?
-        let cachedSnapshot = overlaySnapshot ?? (useCachedEntity ? identity[key] : nil)
+        let isDeleted: Bool
+        let cachedSnapshot: ManagedEntitySnapshot?
+        switch overlayState {
+        case let .snapshot(snapshot):
+            cachedSnapshot = snapshot
+            isDeleted = false
+        case .deleted:
+            cachedSnapshot = nil
+            isDeleted = true
+        case nil:
+            cachedSnapshot = useCachedEntity ? identity[key] : nil
+            isDeleted = false
+        }
         if let cachedSnapshot {
             guard cachedSnapshot.entityType == ObjectIdentifier(type) else {
                 throw ORMError.identityMapTypeMismatch(
@@ -234,7 +268,8 @@ public actor Session {
         return EntityFindPlan(
             tableName: schema.tableName,
             statement: schema.findStatement(primaryKey: primaryKey),
-            cachedEntity: cachedEntity
+            cachedEntity: cachedEntity,
+            isDeleted: isDeleted
         )
     }
 
@@ -261,7 +296,7 @@ public actor Session {
     fileprivate func unitOfWorkUpdatePlan<E: Entity>(
         for entity: E,
         from originalSnapshot: ManagedEntitySnapshot,
-        overlaySnapshot: ManagedEntitySnapshot?,
+        overlayState: ManagedEntityState?,
         useCachedEntity: Bool,
         returning: Bool,
         token: UUID
@@ -286,7 +321,15 @@ public actor Session {
             )
         }
         let key = EntityKey(type: ObjectIdentifier(E.self), primaryKey: primaryKey)
-        let cachedSnapshot = overlaySnapshot ?? (useCachedEntity ? identity[key] : nil)
+        let cachedSnapshot: ManagedEntitySnapshot?
+        switch overlayState {
+        case let .snapshot(snapshot):
+            cachedSnapshot = snapshot
+        case .deleted:
+            cachedSnapshot = nil
+        case nil:
+            cachedSnapshot = useCachedEntity ? identity[key] : nil
+        }
         guard let cachedSnapshot else {
             throw ORMError.entityNotManaged(
                 table: schema.tableName,
@@ -314,6 +357,60 @@ public actor Session {
             ),
             primaryKey: primaryKey,
             snapshot: updatedSnapshot
+        )
+    }
+
+    fileprivate func unitOfWorkDeletePlan<E: Entity>(
+        for type: E.Type,
+        from originalSnapshot: ManagedEntitySnapshot,
+        overlayState: ManagedEntityState?,
+        useCachedEntity: Bool,
+        token: UUID
+    ) throws -> EntityDeletePlan {
+        try validateUnitOfWork(token)
+        let schema = try validatedSchema(for: type)
+        guard originalSnapshot.entityType == ObjectIdentifier(type) else {
+            throw ORMError.identityMapTypeMismatch(
+                table: schema.tableName,
+                primaryKey: originalSnapshot.primaryKey
+            )
+        }
+        let primaryKey = originalSnapshot.primaryKey
+        let key = EntityKey(type: ObjectIdentifier(type), primaryKey: primaryKey)
+        let cachedSnapshot: ManagedEntitySnapshot?
+        switch overlayState {
+        case let .snapshot(snapshot):
+            cachedSnapshot = snapshot
+        case .deleted:
+            cachedSnapshot = nil
+        case nil:
+            cachedSnapshot = useCachedEntity ? identity[key] : nil
+        }
+        guard let cachedSnapshot else {
+            throw ORMError.entityNotManaged(
+                table: schema.tableName,
+                primaryKey: primaryKey
+            )
+        }
+        guard cachedSnapshot.entityType == ObjectIdentifier(type) else {
+            throw ORMError.identityMapTypeMismatch(
+                table: schema.tableName,
+                primaryKey: primaryKey
+            )
+        }
+        guard schema.hasSameMappedValues(
+            cachedSnapshot.mappedValues,
+            originalSnapshot.mappedValues
+        ) else {
+            throw ORMError.staleEntitySnapshot(
+                table: schema.tableName,
+                primaryKey: primaryKey
+            )
+        }
+        return EntityDeletePlan(
+            tableName: schema.tableName,
+            statement: schema.deleteStatement(primaryKey: primaryKey),
+            primaryKey: primaryKey
         )
     }
 
@@ -370,7 +467,7 @@ public actor UnitOfWork {
     private var lifecycle = Lifecycle.open
     private var inFlightOperations = 0
     private var closeWaiters: [CheckedContinuation<Void, Never>] = []
-    private var overlay: [EntityKey: ManagedEntitySnapshot] = [:]
+    private var overlay: [EntityKey: ManagedEntityState] = [:]
     private var rollbackOnly = false
     private var invalidatesSessionIdentity = false
 
@@ -418,10 +515,13 @@ public actor UnitOfWork {
         let plan = try await session.unitOfWorkFindPlan(
             for: type,
             primaryKey: primaryKey,
-            overlaySnapshot: overlay[key],
+            overlayState: overlay[key],
             useCachedEntity: !invalidatesSessionIdentity,
             token: token
         )
+        if plan.isDeleted {
+            return nil
+        }
         if let cached = plan.cachedEntity {
             return cached
         }
@@ -448,7 +548,7 @@ public actor UnitOfWork {
                 actual: snapshot.primaryKey
             )
         }
-        overlay[key] = snapshot
+        overlay[key] = .snapshot(snapshot)
         return entity
     }
 
@@ -541,14 +641,14 @@ public actor UnitOfWork {
             let plan = try await session.unitOfWorkUpdatePlan(
                 for: entity,
                 from: originalSnapshot,
-                overlaySnapshot: overlay[key],
+                overlayState: overlay[key],
                 useCachedEntity: !invalidatesSessionIdentity,
                 returning: usesReturning,
                 token: token
             )
 
             guard let statement = plan.statement else {
-                overlay[key] = plan.snapshot
+                overlay[key] = .snapshot(plan.snapshot)
                 return entity
             }
 
@@ -582,12 +682,50 @@ public actor UnitOfWork {
                         actual: updatedSnapshot.primaryKey
                     )
                 }
-                overlay[key] = updatedSnapshot
+                overlay[key] = .snapshot(updatedSnapshot)
                 return updated
             }
 
-            overlay[key] = plan.snapshot
+            overlay[key] = .snapshot(plan.snapshot)
             return entity
+        } catch {
+            if writeCompleted {
+                rollbackOnly = true
+            }
+            throw error
+        }
+    }
+
+    /// Deletes the latest managed snapshot and stages a tombstone for transactional reads.
+    public func delete<E: Entity>(_ snapshot: E) async throws {
+        try beginOperation()
+        defer { endOperation() }
+
+        var writeCompleted = false
+        do {
+            let originalSnapshot = try await session.unitOfWorkSnapshot(
+                of: snapshot,
+                token: token
+            )
+            let primaryKey = originalSnapshot.primaryKey
+            let key = EntityKey(type: ObjectIdentifier(E.self), primaryKey: primaryKey)
+            let plan = try await session.unitOfWorkDeletePlan(
+                for: E.self,
+                from: originalSnapshot,
+                overlayState: overlay[key],
+                useCachedEntity: !invalidatesSessionIdentity,
+                token: token
+            )
+            let rendered = try SQLRenderer(dialect: dialect).render(plan.statement)
+            let result = try await executeTransaction(rendered.sql, rendered.parameters)
+            writeCompleted = true
+            await session.invalidateIdentityKeyForUnitOfWork(key, token: token)
+            try validateDeleteAffectedRowCount(
+                result.rowsAffected,
+                table: plan.tableName,
+                primaryKey: plan.primaryKey
+            )
+            overlay[key] = .deleted
         } catch {
             if writeCompleted {
                 rollbackOnly = true
@@ -685,10 +823,28 @@ public actor UnitOfWork {
         }
     }
 
+    private func validateDeleteAffectedRowCount(
+        _ actual: Int?,
+        table: String,
+        primaryKey: SQLValue
+    ) throws {
+        guard let actual else { return }
+        if actual == 0 {
+            throw ORMError.entityNotFound(table: table, primaryKey: primaryKey)
+        }
+        if actual != 1 {
+            throw ORMError.unexpectedDeleteAffectedRowCount(
+                table: table,
+                primaryKey: primaryKey,
+                actual: actual
+            )
+        }
+    }
+
     private var changes: UnitOfWorkChanges {
         UnitOfWorkChanges(
             invalidatesIdentity: invalidatesSessionIdentity,
-            snapshots: overlay
+            entities: overlay
         )
     }
 
@@ -716,7 +872,7 @@ public actor UnitOfWork {
         let plan = try await session.unitOfWorkFindPlan(
             for: type,
             primaryKey: primaryKey,
-            overlaySnapshot: nil,
+            overlayState: nil,
             useCachedEntity: false,
             token: token
         )
@@ -749,7 +905,7 @@ public actor UnitOfWork {
         snapshot: ManagedEntitySnapshot
     ) async -> E {
         let key = EntityKey(type: ObjectIdentifier(E.self), primaryKey: snapshot.primaryKey)
-        overlay[key] = snapshot
+        overlay[key] = .snapshot(snapshot)
         // COMMIT may succeed before its caller observes cancellation or a timeout.
         await session.invalidateIdentityKeyForUnitOfWork(key, token: token)
         return inserted
