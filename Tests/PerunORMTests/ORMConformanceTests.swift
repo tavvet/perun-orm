@@ -24,6 +24,23 @@ func postgresPassesSharedORMFindConformance() async throws {
     )
 }
 
+@Test
+func sqlitePassesSharedORMInsertConformance() async throws {
+    try await runSharedORMInsertConformance(
+        database: SQLiteDatabase(configuration: .memory(), maxConnections: 1)
+    )
+}
+
+@Test(.enabled(if: ProcessInfo.processInfo.environment["PERUN_PGSQL_INTEGRATION"] == "1"))
+func postgresPassesSharedORMInsertConformance() async throws {
+    try await runSharedORMInsertConformance(
+        database: PostgresDatabase(
+            configuration: ormPostgresIntegrationConfiguration(),
+            maxConnections: 1
+        )
+    )
+}
+
 private func runSharedORMFindConformance(database: any Database) async throws {
     let dialect = database.dialect
     let renderer = SQLRenderer(dialect: dialect)
@@ -95,6 +112,116 @@ private func runSharedORMFindConformance(database: any Database) async throws {
     await database.shutdown()
 }
 
+private func runSharedORMInsertConformance(database: any Database) async throws {
+    let dialect = database.dialect
+    let renderer = SQLRenderer(dialect: dialect)
+    let tableName = ORMInsertRecord.tableName
+    let table = dialect.quoteIdentifier(tableName)
+    let dropSQL = "DROP TABLE IF EXISTS \(table)"
+
+    do {
+        _ = try await database.execute(dropSQL, [])
+
+        let schema = try EntitySchema(ORMInsertRecord.self)
+        let createTable = try renderer.render(schema.createTableStatement)
+        _ = try await database.execute(createTable.sql, createTable.parameters)
+
+        let session = Session(database: database)
+        let inserted = try await session.withUnitOfWork { unitOfWork in
+            let inserted = try await unitOfWork.insert(
+                ORMInsertRecord(
+                    id: 0,
+                    name: "committed",
+                    nickname: nil,
+                    isActive: true
+                )
+            )
+            let found = try await unitOfWork.find(ORMInsertRecord.self, inserted.id)
+            #expect(found == inserted)
+            return inserted
+        }
+        #expect(inserted.id > 0)
+
+        let committedSnapshot = try await session.find(ORMInsertRecord.self, inserted.id)
+        #expect(committedSnapshot == inserted)
+        let freshSession = Session(database: database)
+        let stored = try await freshSession.find(ORMInsertRecord.self, inserted.id)
+        #expect(stored == inserted)
+
+        let rawDeletedID = try await session.withUnitOfWork { unitOfWork in
+            let rawDeleted = try await unitOfWork.insert(
+                ORMInsertRecord(
+                    id: 0,
+                    name: "raw-deleted",
+                    nickname: nil,
+                    isActive: false
+                )
+            )
+            let delete = try renderer.render(
+                SQLDelete(
+                    table: tableName,
+                    predicate: .comparison(
+                        column: "id",
+                        op: .eq,
+                        value: .int(rawDeleted.id)
+                    )
+                )
+            )
+            _ = try await unitOfWork.execute(delete.sql, delete.parameters)
+            return rawDeleted.id
+        }
+        let missingAfterRawDelete = try await session.find(ORMInsertRecord.self, rawDeletedID)
+        #expect(missingAfterRawDelete == nil)
+
+        do {
+            let _: Void = try await session.withUnitOfWork { unitOfWork in
+                do {
+                    _ = try await unitOfWork.execute("/* boundary */ ROLLBACK")
+                    Issue.record("unit of work accepted transaction control")
+                } catch let error as SessionError {
+                    #expect(
+                        error == .transactionControlNotAllowed(command: "ROLLBACK")
+                    )
+                }
+            }
+            Issue.record("unit of work committed after rejected transaction control")
+        } catch let error as SessionError {
+            #expect(error == .unitOfWorkRollbackOnly)
+        }
+
+        let rolledBackID = ORMGeneratedIDBox()
+        do {
+            let _: Void = try await session.withUnitOfWork { unitOfWork in
+                let rolledBack = try await unitOfWork.insert(
+                    ORMInsertRecord(
+                        id: 0,
+                        name: "rolled-back",
+                        nickname: "temporary",
+                        isActive: false
+                    )
+                )
+                await rolledBackID.store(rolledBack.id)
+                throw ORMInsertConformanceError.rollback
+            }
+            Issue.record("failing ORM unit of work unexpectedly committed")
+        } catch let error as ORMInsertConformanceError {
+            #expect(error == .rollback)
+        }
+
+        let generatedID = try #require(await rolledBackID.value)
+        let missingAfterRollback = try await session.find(ORMInsertRecord.self, generatedID)
+        #expect(missingAfterRollback == nil)
+
+        _ = try await database.execute(dropSQL, [])
+    } catch {
+        _ = try? await database.execute(dropSQL, [])
+        await database.shutdown()
+        throw error
+    }
+
+    await database.shutdown()
+}
+
 private struct ORMFindRecord: Entity, Equatable {
     typealias PK = Int64
 
@@ -131,6 +258,56 @@ private struct ORMFindRecord: Entity, Equatable {
         nickname = try row.decode("nickname", as: String?.self)
         isActive = try row.decode("is_active", as: Bool.self)
     }
+}
+
+private struct ORMInsertRecord: Entity, Equatable {
+    typealias PK = Int64
+
+    let id: Int64
+    let name: String
+    let nickname: String?
+    let isActive: Bool
+
+    static let tableName = "perun_orm_insert_"
+        + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+    static var fields: [FieldDescriptor<ORMInsertRecord>] {
+        [
+            FieldDescriptor(
+                \ORMInsertRecord.id,
+                column: "id",
+                role: .primaryKey(generated: true)
+            ),
+            FieldDescriptor(\ORMInsertRecord.name, column: "name"),
+            FieldDescriptor(\ORMInsertRecord.nickname, column: "nickname"),
+            FieldDescriptor(\ORMInsertRecord.isActive, column: "is_active"),
+        ]
+    }
+
+    init(id: Int64, name: String, nickname: String?, isActive: Bool) {
+        self.id = id
+        self.name = name
+        self.nickname = nickname
+        self.isActive = isActive
+    }
+
+    init(row: any Row) throws {
+        id = try row.decode("id", as: Int64.self)
+        name = try row.decode("name", as: String.self)
+        nickname = try row.decode("nickname", as: String?.self)
+        isActive = try row.decode("is_active", as: Bool.self)
+    }
+}
+
+private actor ORMGeneratedIDBox {
+    private(set) var value: Int64?
+
+    func store(_ value: Int64) {
+        self.value = value
+    }
+}
+
+private enum ORMInsertConformanceError: Error, Sendable, Equatable {
+    case rollback
 }
 
 private func ormPostgresIntegrationConfiguration() -> ConnectionConfiguration {

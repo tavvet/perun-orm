@@ -133,6 +133,13 @@ public struct EntitySchema<E: Entity> {
 }
 
 extension EntitySchema {
+    var primaryKeyIsGenerated: Bool {
+        if case .primaryKey(generated: true) = primaryKey.role {
+            return true
+        }
+        return false
+    }
+
     var createTableStatement: SQLCreateTable {
         SQLCreateTable(
             table: tableName,
@@ -145,6 +152,22 @@ extension EntitySchema {
                     role: field.role.sqlRole
                 )
             }
+        )
+    }
+
+    func insertStatement(_ entity: E, returning: Bool) -> SQLInsert {
+        SQLInsert(
+            table: tableName,
+            values: fields.compactMap { field in
+                if case .primaryKey(generated: true) = field.role {
+                    return nil
+                }
+                return SQLColumnValue(
+                    column: field.column,
+                    value: field.read(from: entity)
+                )
+            },
+            returning: returning ? fields.map(\.column) : []
         )
     }
 
