@@ -206,11 +206,24 @@ private func assertAffectedRowsAndTransactions(
     table: String,
     columns: DBALConformanceColumns
 ) async throws {
-    let updateSQL = "UPDATE \(table) SET \(columns.name) = \(dialect.placeholder(at: 1)) "
-        + "WHERE \(columns.id) = \(dialect.placeholder(at: 2))"
-    let updated = try await database.execute(updateSQL, [.text("updated"), .int(1)])
+    let renderedUpdate = try renderUpdate(
+        dialect: dialect,
+        tableName: tableName,
+        id: 1,
+        name: "updated"
+    )
+    let updated = try await database.execute(renderedUpdate.sql, renderedUpdate.parameters)
     #expect(updated.rowsAffected == 1)
-    let missing = try await database.execute(updateSQL, [.text("missing"), .int(404)])
+    let renderedMissingUpdate = try renderUpdate(
+        dialect: dialect,
+        tableName: tableName,
+        id: 404,
+        name: "missing"
+    )
+    let missing = try await database.execute(
+        renderedMissingUpdate.sql,
+        renderedMissingUpdate.parameters
+    )
     #expect(missing.rowsAffected == 0)
 
     let committedValues = try DBALConformanceValues.make(id: 2, name: "committed")
@@ -285,6 +298,23 @@ private func renderInsert(
     )
 }
 
+private func renderUpdate(
+    dialect: any SQLDialect,
+    tableName: String,
+    id: Int64,
+    name: String,
+    returning: [String] = []
+) throws -> RenderedSQL {
+    try SQLRenderer(dialect: dialect).render(
+        SQLUpdate(
+            table: tableName,
+            assignments: [SQLColumnValue(column: "name", value: .text(name))],
+            predicate: .comparison(column: "id", op: .eq, value: .int(id)),
+            returning: returning
+        )
+    )
+}
+
 private func assertReturningCapability(
     database: any Database,
     dialect: any SQLDialect,
@@ -310,6 +340,25 @@ private func assertReturningCapability(
     let row = try #require(result.rows.first)
     #expect(try row.decode("id", as: Int64.self) == values.id)
     #expect(try row.decode("name", as: String.self) == values.name)
+
+    let updatedName = "returned and updated"
+    let renderedUpdate = try renderUpdate(
+        dialect: dialect,
+        tableName: tableName,
+        id: values.id,
+        name: updatedName,
+        returning: ["id", "name"]
+    )
+    let updateResult = try await database.execute(
+        renderedUpdate.sql,
+        renderedUpdate.parameters
+    )
+    #expect(updateResult.rowsAffected == 1)
+    #expect(updateResult.rows.count == 1)
+
+    let updatedRow = try #require(updateResult.rows.first)
+    #expect(try updatedRow.decode("id", as: Int64.self) == values.id)
+    #expect(try updatedRow.decode("name", as: String.self) == updatedName)
 
     let deleteSQL = "DELETE FROM \(table) WHERE \(columns.id) = \(dialect.placeholder(at: 1))"
     let deleted = try await database.execute(deleteSQL, [.int(values.id)])

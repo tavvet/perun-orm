@@ -70,7 +70,7 @@ public struct SQLSelect: Sendable, Hashable {
     }
 }
 
-/// One target column and its bound value in an INSERT statement.
+/// One target column and its bound value in a DML statement.
 public struct SQLColumnValue: Sendable, Hashable {
     public let column: String
     public let value: SQLValue
@@ -98,6 +98,26 @@ public struct SQLInsert: Sendable, Hashable {
     }
 }
 
+/// A single-table UPDATE. A missing predicate intentionally targets every row.
+public struct SQLUpdate: Sendable, Hashable {
+    public let table: String
+    public let assignments: [SQLColumnValue]
+    public let predicate: SQLPredicate?
+    public let returning: [String]
+
+    public init(
+        table: String,
+        assignments: [SQLColumnValue],
+        predicate: SQLPredicate?,
+        returning: [String] = []
+    ) {
+        self.table = table
+        self.assignments = assignments
+        self.predicate = predicate
+        self.returning = returning
+    }
+}
+
 public enum SQLRenderError: Error, Sendable, Equatable {
     case emptyTable
     case noSelectedColumns
@@ -108,6 +128,8 @@ public enum SQLRenderError: Error, Sendable, Equatable {
     case negativeOffset(Int)
     case offsetRequiresLimit
     case duplicateInsertColumn(String)
+    case noUpdatedColumns
+    case duplicateUpdateColumn(String)
     case returningUnsupported
 }
 
@@ -175,18 +197,8 @@ public struct SQLRenderer: Sendable {
                 throw SQLRenderError.duplicateInsertColumn(value.column)
             }
         }
-        try insert.returning.forEach(validateColumn)
-
-        let returningPlan: SQLInsertReturningPlan?
-        if insert.returning.isEmpty {
-            returningPlan = nil
-        } else {
-            guard dialect.capabilities.contains(.returning),
-                  let plan = try dialect.insertReturningPlan(columns: insert.returning)
-            else {
-                throw SQLRenderError.returningUnsupported
-            }
-            returningPlan = plan
+        let returningPlan = try returningPlan(for: insert.returning) {
+            try dialect.insertReturningPlan(columns: $0)
         }
 
         var binder = ParamBinder(dialect: dialect)
@@ -199,7 +211,7 @@ public struct SQLRenderer: Sendable {
             sql += " (\(columns))"
         }
 
-        if let returningPlan, returningPlan.placement == .beforeValues {
+        if let returningPlan, returningPlan.placement == .embedded {
             sql += " " + render(returningPlan)
         }
 
@@ -219,7 +231,60 @@ public struct SQLRenderer: Sendable {
         return RenderedSQL(sql: sql, parameters: binder.parameters)
     }
 
-    private func render(_ returning: SQLInsertReturningPlan) -> String {
+    public func render(_ update: SQLUpdate) throws -> RenderedSQL {
+        try validateTable(update.table)
+        guard !update.assignments.isEmpty else {
+            throw SQLRenderError.noUpdatedColumns
+        }
+
+        var updatedColumns: Set<String> = []
+        for assignment in update.assignments {
+            try validateColumn(assignment.column)
+            guard updatedColumns.insert(assignment.column.lowercased()).inserted else {
+                throw SQLRenderError.duplicateUpdateColumn(assignment.column)
+            }
+        }
+        let returningPlan = try returningPlan(for: update.returning) {
+            try dialect.updateReturningPlan(columns: $0)
+        }
+
+        var binder = ParamBinder(dialect: dialect)
+        let assignments = update.assignments.map { assignment in
+            "\(dialect.quoteIdentifier(assignment.column)) = \(binder.bind(assignment.value))"
+        }
+        var sql = "UPDATE \(dialect.quoteIdentifier(update.table)) "
+            + "SET \(assignments.joined(separator: ", "))"
+
+        if let returningPlan, returningPlan.placement == .embedded {
+            sql += " " + render(returningPlan)
+        }
+
+        if let predicate = update.predicate {
+            sql += " WHERE \(try render(predicate, binder: &binder))"
+        }
+
+        if let returningPlan, returningPlan.placement == .suffix {
+            sql += " " + render(returningPlan)
+        }
+
+        return RenderedSQL(sql: sql, parameters: binder.parameters)
+    }
+
+    private func returningPlan(
+        for columns: [String],
+        using makePlan: ([String]) throws -> SQLDMLReturningPlan?
+    ) throws -> SQLDMLReturningPlan? {
+        try columns.forEach(validateColumn)
+        guard !columns.isEmpty else { return nil }
+        guard dialect.capabilities.contains(.returning),
+              let plan = try makePlan(columns)
+        else {
+            throw SQLRenderError.returningUnsupported
+        }
+        return plan
+    }
+
+    private func render(_ returning: SQLDMLReturningPlan) -> String {
         returning.fragments.map { fragment in
             switch fragment {
             case let .literal(sql):

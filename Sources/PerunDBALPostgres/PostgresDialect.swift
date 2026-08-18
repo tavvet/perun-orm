@@ -34,14 +34,22 @@ public struct PostgresDialect: SQLDialect {
         return SQLPaginationPlan(placement: .suffix, fragments: fragments)
     }
 
-    public func insertReturningPlan(columns: [String]) -> SQLInsertReturningPlan? {
-        var fragments: [SQLInsertReturningFragment] = [.literal("RETURNING ")]
+    public func insertReturningPlan(columns: [String]) -> SQLDMLReturningPlan? {
+        returningPlan(columns: columns)
+    }
+
+    public func updateReturningPlan(columns: [String]) -> SQLDMLReturningPlan? {
+        returningPlan(columns: columns)
+    }
+
+    private func returningPlan(columns: [String]) -> SQLDMLReturningPlan {
+        var fragments: [SQLDMLReturningFragment] = [.literal("RETURNING ")]
         for (index, column) in columns.enumerated() {
             if index > 0 {
                 fragments.append(.literal(", "))
             }
             fragments.append(.column(column))
         }
-        return SQLInsertReturningPlan(placement: .suffix, fragments: fragments)
+        return SQLDMLReturningPlan(placement: .suffix, fragments: fragments)
     }
 }

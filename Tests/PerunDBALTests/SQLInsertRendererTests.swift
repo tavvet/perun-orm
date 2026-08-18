@@ -123,8 +123,8 @@ private struct OutputDialect: SQLDialect {
 
     func placeholder(at position: Int) -> String { ":\(position)" }
 
-    func insertReturningPlan(columns: [String]) -> SQLInsertReturningPlan? {
-        var fragments: [SQLInsertReturningFragment] = [.literal("OUTPUT ")]
+    func insertReturningPlan(columns: [String]) -> SQLDMLReturningPlan? {
+        var fragments: [SQLDMLReturningFragment] = [.literal("OUTPUT ")]
         for (index, column) in columns.enumerated() {
             if index > 0 {
                 fragments.append(.literal(", "))
@@ -134,6 +134,6 @@ private struct OutputDialect: SQLDialect {
                 .column(column),
             ])
         }
-        return SQLInsertReturningPlan(placement: .beforeValues, fragments: fragments)
+        return SQLDMLReturningPlan(placement: .embedded, fragments: fragments)
     }
 }
