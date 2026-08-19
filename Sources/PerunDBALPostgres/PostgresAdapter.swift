@@ -2,10 +2,15 @@ import Foundation
 import PerunDBAL
 import PerunPGSQL
 
+/// Failures while lowering or decoding portable DBAL values through PostgreSQL.
 public enum PostgresAdapterError: Error, Sendable, Equatable {
+    /// A result column OID is incompatible with the requested portable type.
     case typeMismatch(column: String, expected: ColumnType, actualOID: Int32)
+    /// A timestamp result does not contain a valid PostgreSQL timestamp payload.
     case invalidTimestamp(column: String)
+    /// A timestamp cannot be represented within the portable database range.
     case timestampOutOfRange
+    /// A result column uses a format unsupported by the portable adapter.
     case unsupportedResultFormat(column: String, formatCode: Int16)
 }
 
@@ -13,12 +18,21 @@ public enum PostgresAdapterError: Error, Sendable, Equatable {
 public struct PostgresDatabase: Database {
     private let client: PostgresClient
 
+    /// The rendering policy paired with this database executor.
     public var dialect: any SQLDialect { PostgresDialect() }
 
+    /// Creates a DBAL façade that retains an existing PostgreSQL client.
+    ///
+    /// Calling ``shutdown()`` shuts down the supplied client for every holder. Conversely,
+    /// shutting that client down elsewhere makes this database unusable. Coordinate the shared
+    /// lifecycle at the composition root.
     public init(client: PostgresClient) {
         self.client = client
     }
 
+    /// Creates a DBAL façade with a new PostgreSQL connection pool.
+    ///
+    /// - Precondition: `maxConnections` is greater than zero.
     public init(
         configuration: ConnectionConfiguration,
         maxConnections: Int = 10,
@@ -35,6 +49,7 @@ public struct PostgresDatabase: Database {
         )
     }
 
+    /// Executes caller-rendered positional SQL through the underlying pool.
     public func execute(
         _ sql: String,
         _ parameters: [SQLValue],
@@ -49,6 +64,7 @@ public struct PostgresDatabase: Database {
         return normalize(result)
     }
 
+    /// Executes `body` in one PostgreSQL transaction on one pooled connection.
     public func withTransaction<T: Sendable>(
         _ body: @Sendable (any Transaction) async throws -> T
     ) async throws -> T {
@@ -57,6 +73,7 @@ public struct PostgresDatabase: Database {
         }
     }
 
+    /// Shuts down the underlying client. Repeated calls are safe.
     public func shutdown() async {
         await client.shutdown()
     }

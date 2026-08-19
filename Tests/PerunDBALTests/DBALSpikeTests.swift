@@ -202,3 +202,43 @@ func sqliteAdapterKeepsGeneratedRowIDHintsScoped() async throws {
 
     await database.shutdown()
 }
+
+@Test
+func sqliteAdapterDefaultsToOneConnection() {
+    #expect(SQLiteDatabase.defaultMaxConnections == 1)
+}
+
+@Test
+func adapterDatabasesAdoptInjectedClientLifecycle() async throws {
+    let sqliteClient = SQLiteClient(configuration: .memory(), maxConnections: 1)
+    let sqliteDatabase = SQLiteDatabase(client: sqliteClient)
+    await sqliteDatabase.shutdown()
+
+    do {
+        _ = try await sqliteClient.query("SELECT 1")
+        Issue.record("SQLiteDatabase.shutdown() did not shut down its injected client")
+    } catch let error as PerunSQLite.PerunError {
+        #expect(error == .clientShutdown)
+    }
+
+    let postgresClient = PostgresClient(
+        configuration: ConnectionConfiguration(
+            user: "perun",
+            database: "perun",
+            tlsMode: .disable
+        ),
+        maxConnections: 1
+    )
+    let postgresDatabase = PostgresDatabase(client: postgresClient)
+    await postgresDatabase.shutdown()
+
+    do {
+        _ = try await postgresClient.query("SELECT 1")
+        Issue.record("PostgresDatabase.shutdown() did not shut down its injected client")
+    } catch let error as PerunPGSQL.PerunError {
+        guard case .clientShutdown = error else {
+            Issue.record("unexpected PostgreSQL client error after shutdown: \(error)")
+            return
+        }
+    }
+}

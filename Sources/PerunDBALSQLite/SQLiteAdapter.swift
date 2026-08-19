@@ -2,14 +2,18 @@ import Foundation
 import PerunDBAL
 import PerunSQLite
 
+/// SQLite rendering policy.
 public struct SQLiteDialect: SQLDialect {
     // RETURNING stays disabled until the driver exposes the runtime SQLite version (>= 3.35).
+    /// SQLite features used by the portable renderer and ORM.
     public let capabilities: DialectCapabilities = [
         .lastInsertRowID,
     ]
 
+    /// Creates a stateless SQLite rendering policy.
     public init() {}
 
+    /// Returns SQLite's positional `?` placeholder after validating a one-based position.
     public func placeholder(at position: Int) -> String {
         precondition(position > 0, "placeholder positions are one-based")
         return "?"
@@ -51,27 +55,52 @@ public struct SQLiteDialect: SQLDialect {
     }
 }
 
+/// Failures while lowering or decoding portable DBAL values through SQLite.
 public enum SQLiteAdapterError: Error, Sendable, Equatable {
+    /// A result cell uses a SQLite storage class incompatible with the requested type.
     case typeMismatch(column: String, expected: ColumnType)
+    /// A boolean result contains an integer other than the portable `0` or `1` values.
     case invalidBoolean(column: String, value: Int64)
+    /// A timestamp result does not use the canonical portable representation.
     case invalidTimestamp(column: String)
+    /// A UUID result does not use its canonical textual representation.
     case invalidUUID(column: String)
+    /// A timestamp cannot be represented within the portable database range.
     case timestampOutOfRange
 }
 
 /// DBAL façade over the standalone SQLite connection pool.
 public struct SQLiteDatabase: Database {
+    /// Default pool capacity used by the configuration initializer.
+    public static let defaultMaxConnections = 1
+
     private let client: SQLiteClient
 
+    /// The rendering policy paired with this database executor.
     public var dialect: any SQLDialect { SQLiteDialect() }
 
+    /// Creates a DBAL façade that retains an existing SQLite client.
+    ///
+    /// Calling ``shutdown()`` shuts down the supplied client for every holder. Conversely,
+    /// shutting that client down elsewhere makes this database unusable. Coordinate the shared
+    /// lifecycle at the composition root.
     public init(client: SQLiteClient) {
         self.client = client
     }
 
+    /// Creates a DBAL façade with a new SQLite connection pool.
+    ///
+    /// A single connection is the safe default, especially for `SQLiteConfiguration.memory()`,
+    /// whose database is private to one connection. A private in-memory database also vanishes when
+    /// that connection is recycled, so keep `maxConnectionLifetime` and `maxIdleTime` set to `nil`.
+    /// A shared-cache in-memory URI permits a larger pool but still vanishes when its last connection
+    /// closes. Use a file database before enabling connection recycling, and be prepared for
+    /// SQLite's locking semantics when using more than one connection.
+    ///
+    /// - Precondition: `maxConnections` is greater than zero.
     public init(
         configuration: SQLiteConfiguration,
-        maxConnections: Int = 10,
+        maxConnections: Int = SQLiteDatabase.defaultMaxConnections,
         maxConnectionLifetime: Duration? = nil,
         maxIdleTime: Duration? = nil
     ) {
@@ -85,6 +114,7 @@ public struct SQLiteDatabase: Database {
         )
     }
 
+    /// Executes caller-rendered positional SQL through the underlying pool.
     public func execute(
         _ sql: String,
         _ parameters: [SQLValue],
@@ -94,6 +124,7 @@ public struct SQLiteDatabase: Database {
         return normalize(result, intent: intent)
     }
 
+    /// Executes `body` in one SQLite transaction on one pooled connection.
     public func withTransaction<T: Sendable>(
         _ body: @Sendable (any Transaction) async throws -> T
     ) async throws -> T {
@@ -102,6 +133,7 @@ public struct SQLiteDatabase: Database {
         }
     }
 
+    /// Shuts down the underlying client. Repeated calls are safe.
     public func shutdown() async {
         await client.shutdown()
     }

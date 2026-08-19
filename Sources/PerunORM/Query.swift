@@ -2,6 +2,7 @@ import PerunDBAL
 
 /// Failures while resolving a typed ORM query into validated field metadata.
 public enum ORMQueryError: Error, Sendable, Equatable {
+    /// A query key path is absent from the entity's declared fields.
     case unmappedField(entity: String)
 }
 
@@ -13,6 +14,7 @@ public struct Predicate<E: Entity>: Sendable, Hashable {
         self.core = core
     }
 
+    /// Matches rows whose mapped value equals `value`.
     public static func eq<Value: SQLValueConvertible>(
         _ keyPath: KeyPath<E, Value>,
         _ value: Value
@@ -20,6 +22,7 @@ public struct Predicate<E: Entity>: Sendable, Hashable {
         try comparison(keyPath, op: .eq, value: value.sqlValue)
     }
 
+    /// Matches rows whose mapped value does not equal `value`.
     public static func neq<Value: SQLValueConvertible>(
         _ keyPath: KeyPath<E, Value>,
         _ value: Value
@@ -27,6 +30,7 @@ public struct Predicate<E: Entity>: Sendable, Hashable {
         try comparison(keyPath, op: .neq, value: value.sqlValue)
     }
 
+    /// Matches rows whose mapped value is less than `value`.
     public static func lt<Value: SQLValueConvertible & Comparable>(
         _ keyPath: KeyPath<E, Value>,
         _ value: Value
@@ -34,6 +38,7 @@ public struct Predicate<E: Entity>: Sendable, Hashable {
         try comparison(keyPath, op: .lt, value: value.sqlValue)
     }
 
+    /// Matches rows whose mapped value is less than or equal to `value`.
     public static func lte<Value: SQLValueConvertible & Comparable>(
         _ keyPath: KeyPath<E, Value>,
         _ value: Value
@@ -41,6 +46,7 @@ public struct Predicate<E: Entity>: Sendable, Hashable {
         try comparison(keyPath, op: .lte, value: value.sqlValue)
     }
 
+    /// Matches rows whose mapped value is greater than `value`.
     public static func gt<Value: SQLValueConvertible & Comparable>(
         _ keyPath: KeyPath<E, Value>,
         _ value: Value
@@ -48,6 +54,7 @@ public struct Predicate<E: Entity>: Sendable, Hashable {
         try comparison(keyPath, op: .gt, value: value.sqlValue)
     }
 
+    /// Matches rows whose mapped value is greater than or equal to `value`.
     public static func gte<Value: SQLValueConvertible & Comparable>(
         _ keyPath: KeyPath<E, Value>,
         _ value: Value
@@ -55,6 +62,7 @@ public struct Predicate<E: Entity>: Sendable, Hashable {
         try comparison(keyPath, op: .gte, value: value.sqlValue)
     }
 
+    /// Matches a mapped string using the caller-provided SQL `LIKE` pattern.
     public static func like(
         _ keyPath: KeyPath<E, String>,
         _ pattern: String
@@ -62,6 +70,7 @@ public struct Predicate<E: Entity>: Sendable, Hashable {
         try comparison(keyPath, op: .like, value: pattern.sqlValue)
     }
 
+    /// Matches rows whose optional mapped value is SQL `NULL`.
     public static func isNull<Value: SQLValueConvertible>(
         _ keyPath: KeyPath<E, Value?>
     ) throws -> Self {
@@ -73,6 +82,10 @@ public struct Predicate<E: Entity>: Sendable, Hashable {
         )
     }
 
+    /// Matches rows whose mapped value belongs to `values`.
+    ///
+    /// An empty list is always false. A list containing an optional `nil` also matches SQL
+    /// `NULL` while preserving the order of non-null bind values.
     public static func `in`<Value: SQLValueConvertible>(
         _ keyPath: KeyPath<E, Value>,
         _ values: [Value]
@@ -85,6 +98,7 @@ public struct Predicate<E: Entity>: Sendable, Hashable {
         )
     }
 
+    /// Combines this predicate with `other` using logical AND.
     public func and(_ other: Self) -> Self {
         var predicates: [SQLPredicate]
         switch core {
@@ -102,6 +116,7 @@ public struct Predicate<E: Entity>: Sendable, Hashable {
         return Self(core: .and(predicates))
     }
 
+    /// Combines this predicate with `other` using logical OR.
     public func or(_ other: Self) -> Self {
         var predicates: [SQLPredicate]
         switch core {
@@ -119,6 +134,7 @@ public struct Predicate<E: Entity>: Sendable, Hashable {
         return Self(core: .or(predicates))
     }
 
+    /// Negates this predicate.
     public func not() -> Self {
         Self(core: .not(core))
     }
@@ -142,6 +158,7 @@ public struct Predicate<E: Entity>: Sendable, Hashable {
 public struct Query<E: Entity>: Sendable, Hashable {
     let statement: SQLSelect
 
+    /// Creates an unfiltered query selecting every mapped field from `entity`.
     public init(_ entity: E.Type = E.self) throws {
         let schema = try EntitySchema(entity)
         statement = SQLSelect(

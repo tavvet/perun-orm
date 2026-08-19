@@ -1,43 +1,67 @@
 /// One rendered statement and its positional bind values.
 public struct RenderedSQL: Sendable, Hashable {
+    /// The rendered statement with backend placeholders.
     public let sql: String
+    /// Bind values in lexical placeholder order.
     public let parameters: [SQLValue]
 
+    /// Creates a rendered statement and its ordered bind values.
     public init(sql: String, parameters: [SQLValue]) {
         self.sql = sql
         self.parameters = parameters
     }
 }
 
+/// Portable comparison operators supported by ``SQLPredicate``.
 public enum ComparisonOp: Sendable, Hashable {
+    /// Equality (`=`), rewritten to `IS NULL` for a null value.
     case eq
+    /// Inequality (`<>`), rewritten to `IS NOT NULL` for a null value.
     case neq
+    /// Strictly less than (`<`).
     case lt
+    /// Less than or equal (`<=`).
     case lte
+    /// Strictly greater than (`>`).
     case gt
+    /// Greater than or equal (`>=`).
     case gte
+    /// SQL pattern matching (`LIKE`).
     case like
 }
 
 /// A backend-neutral predicate over one table. Column names are identifiers, never SQL fragments.
 public indirect enum SQLPredicate: Sendable, Hashable {
+    /// Compares one column with one bound semantic value.
     case comparison(column: String, op: ComparisonOp, value: SQLValue)
+    /// Tests membership in a list of bound values.
     case inList(column: String, values: [SQLValue])
+    /// Tests whether a column is null, optionally negating the test.
     case null(column: String, negated: Bool)
+    /// Combines predicates with logical AND; an empty group is true.
     case and([SQLPredicate])
+    /// Combines predicates with logical OR; an empty group is false.
     case or([SQLPredicate])
+    /// Negates one predicate.
     case not(SQLPredicate)
 }
 
+/// Sort direction for one SQL ordering.
 public enum SQLSortDirection: Sendable, Hashable {
+    /// Ascending order (`ASC`).
     case ascending
+    /// Descending order (`DESC`).
     case descending
 }
 
+/// One identifier-only ordering in a portable SELECT.
 public struct SQLOrdering: Sendable, Hashable {
+    /// The unquoted column identifier.
     public let column: String
+    /// The direction applied to the column.
     public let direction: SQLSortDirection
 
+    /// Creates an ordering for one unquoted column identifier.
     public init(column: String, direction: SQLSortDirection = .ascending) {
         self.column = column
         self.direction = direction
@@ -46,13 +70,20 @@ public struct SQLOrdering: Sendable, Hashable {
 
 /// A single-table SELECT. Projections and orderings are identifier-only in the v0.1 slice.
 public struct SQLSelect: Sendable, Hashable {
+    /// The unquoted table identifier.
     public let table: String
+    /// Unquoted projected column identifiers in result order.
     public let columns: [String]
+    /// The optional row predicate.
     public let predicate: SQLPredicate?
+    /// Ordered sort terms.
     public let orderings: [SQLOrdering]
+    /// The optional nonnegative row limit, validated during rendering.
     public let limit: Int?
+    /// The optional nonnegative row offset, valid only with a limit.
     public let offset: Int?
 
+    /// Creates a portable single-table SELECT description.
     public init(
         table: String,
         columns: [String],
@@ -72,11 +103,15 @@ public struct SQLSelect: Sendable, Hashable {
 
 /// A filtered `COUNT(*)` query. Ordering and pagination are intentionally not represented.
 public struct SQLCount: Sendable, Hashable {
+    /// Stable result-column alias expected by DBAL and ORM count decoders.
     public static let resultColumn = "count"
 
+    /// The unquoted table identifier.
     public let table: String
+    /// The optional row predicate.
     public let predicate: SQLPredicate?
 
+    /// Creates a portable filtered `COUNT(*)` description.
     public init(table: String, predicate: SQLPredicate? = nil) {
         self.table = table
         self.predicate = predicate
@@ -85,9 +120,12 @@ public struct SQLCount: Sendable, Hashable {
 
 /// One target column and its bound value in a DML statement.
 public struct SQLColumnValue: Sendable, Hashable {
+    /// The unquoted target column identifier.
     public let column: String
+    /// The semantic value bound for the column.
     public let value: SQLValue
 
+    /// Creates one column/value pair for INSERT or UPDATE.
     public init(column: String, value: SQLValue) {
         self.column = column
         self.value = value
@@ -96,10 +134,14 @@ public struct SQLColumnValue: Sendable, Hashable {
 
 /// A single-row INSERT. An empty value list renders as `DEFAULT VALUES`.
 public struct SQLInsert: Sendable, Hashable {
+    /// The unquoted target table identifier.
     public let table: String
+    /// Inserted columns and values in bind order.
     public let values: [SQLColumnValue]
+    /// Unquoted columns requested from a row-returning clause.
     public let returning: [String]
 
+    /// Creates a portable single-row INSERT description.
     public init(
         table: String,
         values: [SQLColumnValue],
@@ -113,11 +155,16 @@ public struct SQLInsert: Sendable, Hashable {
 
 /// A single-table UPDATE. A missing predicate intentionally targets every row.
 public struct SQLUpdate: Sendable, Hashable {
+    /// The unquoted target table identifier.
     public let table: String
+    /// Assigned columns and values in bind order.
     public let assignments: [SQLColumnValue]
+    /// The optional row predicate; `nil` explicitly targets every row.
     public let predicate: SQLPredicate?
+    /// Unquoted columns requested from a row-returning clause.
     public let returning: [String]
 
+    /// Creates a portable UPDATE description.
     public init(
         table: String,
         assignments: [SQLColumnValue],
@@ -133,10 +180,14 @@ public struct SQLUpdate: Sendable, Hashable {
 
 /// A single-table DELETE. The predicate argument is required; explicit `nil` targets every row.
 public struct SQLDelete: Sendable, Hashable {
+    /// The unquoted target table identifier.
     public let table: String
+    /// The optional row predicate; `nil` explicitly targets every row.
     public let predicate: SQLPredicate?
+    /// Unquoted columns requested from a row-returning clause.
     public let returning: [String]
 
+    /// Creates a portable DELETE description.
     public init(
         table: String,
         predicate: SQLPredicate?,
@@ -148,19 +199,28 @@ public struct SQLDelete: Sendable, Hashable {
     }
 }
 
+/// Structural role of one portable table column.
 public enum SQLColumnRole: Sendable, Hashable {
+    /// A regular mapped attribute.
     case attribute
+    /// The table primary key, optionally generated by the backend.
     case primaryKey(generated: Bool)
 }
 
 /// One portable column definition in a CREATE TABLE statement.
 public struct SQLColumnDefinition: Sendable, Hashable {
+    /// The unquoted column identifier.
     public let name: String
+    /// The portable column type.
     public let type: ColumnType
+    /// Whether generated DDL permits SQL `NULL`.
     public let isNullable: Bool
+    /// Whether generated DDL adds a column-level uniqueness constraint.
     public let isUnique: Bool
+    /// The structural role of the column.
     public let role: SQLColumnRole
 
+    /// Creates one portable CREATE TABLE column definition.
     public init(
         name: String,
         type: ColumnType,
@@ -178,43 +238,67 @@ public struct SQLColumnDefinition: Sendable, Hashable {
 
 /// A portable CREATE TABLE with column-level constraints only.
 public struct SQLCreateTable: Sendable, Hashable {
+    /// The unquoted table identifier.
     public let table: String
+    /// Column definitions in declaration order.
     public let columns: [SQLColumnDefinition]
 
+    /// Creates a portable CREATE TABLE description.
     public init(table: String, columns: [SQLColumnDefinition]) {
         self.table = table
         self.columns = columns
     }
 }
 
+/// Structural validation failures reported before SQL is returned to an executor.
 public enum SQLRenderError: Error, Sendable, Equatable {
+    /// The table identifier is empty.
     case emptyTable
+    /// A SELECT projection contains no columns.
     case noSelectedColumns
+    /// A column identifier is empty.
     case emptyColumn
+    /// An identifier contains a null byte.
     case identifierContainsNullByte
+    /// An ordered or pattern comparison was given SQL `NULL`.
     case nullComparison(ComparisonOp)
+    /// A SELECT limit is negative.
     case negativeLimit(Int)
+    /// A SELECT offset is negative.
     case negativeOffset(Int)
+    /// An offset was supplied without a limit.
     case offsetRequiresLimit
+    /// An INSERT names the same column more than once, ignoring case.
     case duplicateInsertColumn(String)
+    /// An UPDATE contains no assignments.
     case noUpdatedColumns
+    /// An UPDATE assigns the same column more than once, ignoring case.
     case duplicateUpdateColumn(String)
+    /// Returning columns were requested from a dialect without a returning plan.
     case returningUnsupported
+    /// A CREATE TABLE statement contains no columns.
     case noTableColumns
+    /// A CREATE TABLE statement repeats a column name, ignoring case.
     case duplicateTableColumn(String)
+    /// A CREATE TABLE statement declares more than one primary key column.
     case multiplePrimaryKeys
+    /// A primary key column was declared nullable.
     case nullablePrimaryKey(String)
+    /// A generated primary key uses a portable type other than `Int64`.
     case generatedPrimaryKeyRequiresInt64(column: String, actual: ColumnType)
 }
 
 /// Pure renderer: it never executes SQL and owns no mutable state between calls.
 public struct SQLRenderer: Sendable {
+    /// The backend policy used for quoting, placeholders, types, and grammar placement.
     public let dialect: any SQLDialect
 
+    /// Creates a stateless renderer for `dialect`.
     public init(dialect: any SQLDialect) {
         self.dialect = dialect
     }
 
+    /// Validates and renders a portable SELECT.
     public func render(_ select: SQLSelect) throws -> RenderedSQL {
         try validateTable(select.table)
         guard !select.columns.isEmpty else {
@@ -261,6 +345,7 @@ public struct SQLRenderer: Sendable {
         return RenderedSQL(sql: sql, parameters: binder.parameters)
     }
 
+    /// Validates and renders a portable `COUNT(*)` SELECT.
     public func render(_ count: SQLCount) throws -> RenderedSQL {
         try validateTable(count.table)
 
@@ -273,6 +358,7 @@ public struct SQLRenderer: Sendable {
         return RenderedSQL(sql: sql, parameters: binder.parameters)
     }
 
+    /// Validates and renders a single-row INSERT.
     public func render(_ insert: SQLInsert) throws -> RenderedSQL {
         try validateTable(insert.table)
 
@@ -317,6 +403,7 @@ public struct SQLRenderer: Sendable {
         return RenderedSQL(sql: sql, parameters: binder.parameters)
     }
 
+    /// Validates and renders an UPDATE.
     public func render(_ update: SQLUpdate) throws -> RenderedSQL {
         try validateTable(update.table)
         guard !update.assignments.isEmpty else {
@@ -356,6 +443,7 @@ public struct SQLRenderer: Sendable {
         return RenderedSQL(sql: sql, parameters: binder.parameters)
     }
 
+    /// Validates and renders a DELETE.
     public func render(_ delete: SQLDelete) throws -> RenderedSQL {
         try validateTable(delete.table)
         let returningPlan = try returningPlan(for: delete.returning) {
@@ -380,6 +468,7 @@ public struct SQLRenderer: Sendable {
         return RenderedSQL(sql: sql, parameters: binder.parameters)
     }
 
+    /// Validates and renders a portable CREATE TABLE statement.
     public func render(_ createTable: SQLCreateTable) throws -> RenderedSQL {
         try validateTable(createTable.table)
         guard !createTable.columns.isEmpty else {

@@ -2,18 +2,31 @@ import Foundation
 
 /// A backend-neutral row. Decoding is driven by the requested Swift type.
 public protocol Row: Sendable {
+    /// Decodes `column` through its requested portable Swift type.
+    ///
+    /// SQL `NULL` is passed to `T` and therefore succeeds only for a type such as `Optional`
+    /// that accepts ``SQLValue/null``. Missing columns and incompatible values throw.
     func decode<T: SQLValueConvertible>(_ column: String, as type: T.Type) throws -> T
+
+    /// Returns `nil` for SQL `NULL`; otherwise decodes `column` as `T`.
+    ///
+    /// Missing columns and incompatible non-null values throw.
     func decodeIfPresent<T: SQLValueConvertible>(_ column: String, as type: T.Type) throws -> T?
 }
 
 /// The normalized outcome of one SQL statement.
 public struct ExecResult: Sendable {
+    /// Rows produced by a query or a DML row-returning clause, in backend order.
     public let rows: [any Row]
+    /// The affected-row count, or `nil` when the backend cannot report it reliably.
     public let rowsAffected: Int?
     /// SQLite's connection-local rowid hint, exposed only for a proven generated-rowid insert.
     /// It is not necessarily a mapped primary key.
     public let lastInsertRowID: Int64?
 
+    /// Creates a normalized execution result.
+    ///
+    /// Custom executors are responsible for preserving the field invariants documented above.
     public init(
         rows: [any Row] = [],
         rowsAffected: Int? = nil,
@@ -35,6 +48,10 @@ public enum ExecutionIntent: Sendable, Hashable {
 
 /// Something capable of executing already-rendered positional SQL.
 public protocol SQLExecutor: Sendable {
+    /// Executes one caller-rendered statement with parameters in placeholder order.
+    ///
+    /// `intent` is a trusted semantic assertion made by the caller. Implementations must not
+    /// infer a stronger intent by parsing arbitrary SQL.
     func execute(
         _ sql: String,
         _ parameters: [SQLValue],
@@ -43,26 +60,47 @@ public protocol SQLExecutor: Sendable {
 }
 
 public extension SQLExecutor {
+    /// Executes arbitrary positional SQL without exposing backend-specific result hints.
     func execute(_ sql: String, _ parameters: [SQLValue]) async throws -> ExecResult {
         try await execute(sql, parameters, intent: .arbitrary)
     }
 }
 
-/// A closure-scoped executor. It intentionally cannot create nested transactions.
+/// A closure-scoped executor that is valid only during its `Database.withTransaction` body.
+///
+/// A transaction must reject or otherwise safely fail operations attempted after that body
+/// returns. It intentionally cannot create nested transactions.
 public protocol Transaction: SQLExecutor {}
 
 /// A logical database façade, normally backed by a connection pool.
 public protocol Database: SQLExecutor {
+    /// The rendering policy paired with this executor.
+    ///
+    /// Callers must render statements with this dialect rather than combining an executor with
+    /// an independently selected backend dialect.
     var dialect: any SQLDialect { get }
 
+    /// Runs `body` on one transaction-scoped executor.
+    ///
+    /// Route every database operation in `body` through the supplied ``Transaction``. Re-entering
+    /// this database from the closure does not join the active transaction: a pooled implementation
+    /// may execute that work on another connection or block while waiting for one.
+    ///
+    /// Returning normally commits. If `body` throws, including an observed cancellation error,
+    /// the implementation rolls back and rethrows. The supplied ``Transaction`` must not escape
+    /// the closure for later use, and this method does not permit nested transactions.
     func withTransaction<T: Sendable>(
         _ body: @Sendable (any Transaction) async throws -> T
     ) async throws -> T
 
     /// Releases the underlying pool/client. The composition root owns this lifecycle.
+    ///
+    /// Implementations must make repeated calls safe. New work after shutdown fails with the
+    /// underlying client's typed shutdown error.
     func shutdown() async
 }
 
+/// Features that a paired dialect and executor can provide without unsafe emulation.
 public struct DialectCapabilities: OptionSet, Sendable, Hashable {
     public let rawValue: UInt16
 
@@ -70,17 +108,24 @@ public struct DialectCapabilities: OptionSet, Sendable, Hashable {
         self.rawValue = rawValue
     }
 
+    /// DML statements can return requested rows through a dialect-provided clause.
     public static let returning = Self(rawValue: 1 << 0)
+    /// Proven generated-rowid inserts can expose ``ExecResult/lastInsertRowID``.
     public static let lastInsertRowID = Self(rawValue: 1 << 1)
+    /// The backend has a native boolean type.
     public static let nativeBoolean = Self(rawValue: 1 << 2)
+    /// The backend has a native timestamp type matching the portable timestamp semantics.
     public static let nativeTimestamp = Self(rawValue: 1 << 3)
+    /// The backend has a native UUID type.
     public static let nativeUUID = Self(rawValue: 1 << 4)
 }
 
 /// SELECT facts that can affect a backend's pagination grammar.
 public struct SQLPaginationContext: Sendable, Hashable {
+    /// Whether the rendered SELECT already contains at least one ordering.
     public let hasOrderings: Bool
 
+    /// Creates pagination context for the SELECT currently being rendered.
     public init(hasOrderings: Bool) {
         self.hasOrderings = hasOrderings
     }
@@ -104,9 +149,12 @@ public enum SQLPaginationFragment: Sendable, Hashable {
 
 /// A backend-specific pagination clause that the renderer emits at its lexical position.
 public struct SQLPaginationPlan: Sendable, Hashable {
+    /// The lexical location at which the renderer inserts `fragments`.
     public let placement: SQLPaginationPlacement
+    /// Ordered trusted literals and bound integer parameters.
     public let fragments: [SQLPaginationFragment]
 
+    /// Creates a pagination plan from ordered trusted fragments.
     public init(
         placement: SQLPaginationPlacement,
         fragments: [SQLPaginationFragment]
@@ -134,9 +182,12 @@ public enum SQLDMLReturningFragment: Sendable, Hashable {
 
 /// A backend-specific DML row-returning clause.
 public struct SQLDMLReturningPlan: Sendable, Hashable {
+    /// The statement-specific location at which the renderer inserts `fragments`.
     public let placement: SQLDMLReturningPlacement
+    /// Ordered trusted literals and renderer-quoted requested columns.
     public let fragments: [SQLDMLReturningFragment]
 
+    /// Creates a DML row-returning plan from ordered trusted fragments.
     public init(
         placement: SQLDMLReturningPlacement,
         fragments: [SQLDMLReturningFragment]
@@ -148,19 +199,36 @@ public struct SQLDMLReturningPlan: Sendable, Hashable {
 
 /// The rendering policy supplied by a concrete backend adapter.
 public protocol SQLDialect: Sendable {
+    /// Features supported jointly by this dialect and its paired executor.
     var capabilities: DialectCapabilities { get }
 
+    /// Returns the backend placeholder for a one-based bind position.
+    ///
+    /// - Precondition: `position` is greater than zero.
     func placeholder(at position: Int) -> String
+
+    /// Quotes one complete identifier according to the backend grammar.
     func quoteIdentifier(_ identifier: String) -> String
+
+    /// Returns the backend column type spelling for a portable type.
     func renderColumnType(_ type: ColumnType) -> String
+
+    /// Returns the complete quoted column phrase for a generated `Int64` primary key.
     func renderGeneratedPrimaryKeyColumn(_ name: String) -> String
+
+    /// Plans a validated pagination clause and its lexical placement.
+    ///
+    /// The renderer supplies a nonnegative `limit` and either `nil` or a nonnegative `offset`.
     func paginationPlan(
         limit: Int,
         offset: Int?,
         context: SQLPaginationContext
     ) throws -> SQLPaginationPlan
+    /// Plans an INSERT row-returning clause for nonempty, validated column names.
     func insertReturningPlan(columns: [String]) throws -> SQLDMLReturningPlan?
+    /// Plans an UPDATE row-returning clause for nonempty, validated column names.
     func updateReturningPlan(columns: [String]) throws -> SQLDMLReturningPlan?
+    /// Plans a DELETE row-returning clause for nonempty, validated column names.
     func deleteReturningPlan(columns: [String]) throws -> SQLDMLReturningPlan?
 }
 

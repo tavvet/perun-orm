@@ -1,43 +1,67 @@
 import Foundation
 import PerunDBAL
 
+/// Lifecycle and concurrency violations at the session or unit-of-work boundary.
 public enum SessionError: Error, Sendable, Equatable {
+    /// A unit of work starts during direct session I/O or another unit of work, or direct I/O is
+    /// attempted during a unit of work.
     case sessionBusy
+    /// A second unit-of-work operation overlaps an operation already in flight.
     case unitOfWorkBusy
+    /// An escaped unit of work is used after its closure has finished.
     case unitOfWorkClosed
+    /// A prior operation made the transaction unsafe to commit, including an executor or
+    /// post-write failure or rejected transaction-control SQL.
     case unitOfWorkRollbackOnly
+    /// Caller-owned raw SQL attempted to control the transaction owned by the unit of work.
     case transactionControlNotAllowed(command: String)
 }
 
 /// ORM-level invariant failures detected after schema validation or row execution.
 public enum ORMError: Error, Sendable, Equatable {
+    /// A cached identity entry cannot be materialized as the requested entity type.
     case identityMapTypeMismatch(table: String, primaryKey: SQLValue)
+    /// A primary-key lookup returned more than one row.
     case multipleRowsForPrimaryKey(table: String, primaryKey: SQLValue)
+    /// A hydrated row carries a primary key different from the requested or written key.
     case hydratedPrimaryKeyMismatch(table: String, expected: SQLValue, actual: SQLValue)
+    /// An update or delete snapshot is detached from this session.
     case entityNotManaged(table: String, primaryKey: SQLValue)
+    /// An update attempted to change the entity primary key.
     case primaryKeyChanged(table: String, expected: SQLValue, actual: SQLValue)
+    /// An update or delete used an older managed snapshot.
     case staleEntitySnapshot(table: String, primaryKey: SQLValue)
+    /// A row required by an eager write disappeared before it could be reloaded.
     case entityNotFound(table: String, primaryKey: SQLValue)
+    /// An UPDATE affected a number of rows incompatible with one primary key.
     case unexpectedUpdateAffectedRowCount(
         table: String,
         primaryKey: SQLValue,
         actual: Int
     )
+    /// An UPDATE row-returning clause produced a number of rows other than one.
     case unexpectedUpdateResultRowCount(
         table: String,
         primaryKey: SQLValue,
         actual: Int
     )
+    /// A DELETE affected a number of rows incompatible with one primary key.
     case unexpectedDeleteAffectedRowCount(
         table: String,
         primaryKey: SQLValue,
         actual: Int
     )
+    /// The selected dialect cannot recover this generated primary key safely.
     case generatedPrimaryKeyRetrievalUnsupported(table: String)
+    /// An INSERT reported an affected-row count other than one.
     case unexpectedInsertAffectedRowCount(table: String, actual: Int?)
+    /// An INSERT row-returning clause produced a number of rows other than one.
     case unexpectedInsertResultRowCount(table: String, actual: Int)
+    /// A proven SQLite generated-rowid insert did not report its row ID.
     case generatedPrimaryKeyUnavailable(table: String)
+    /// Reloading an inserted row by primary key produced an unexpected row count.
     case insertedRowLookupCount(table: String, primaryKey: SQLValue, actual: Int)
+    /// A count query did not return exactly one aggregate row.
     case unexpectedCountResultRowCount(table: String, actual: Int)
 }
 
@@ -118,6 +142,9 @@ public actor Session {
     private var activeUnitOfWork: UUID?
     private var activeDatabaseOperations = 0
 
+    /// Creates a session over a database owned by the composition root.
+    ///
+    /// The session does not shut the database down.
     public init(database: any Database) {
         self.database = database
     }
@@ -231,6 +258,15 @@ public actor Session {
         return try decodeCount(result, table: schema.tableName)
     }
 
+    /// Runs eager ORM operations in one database transaction.
+    ///
+    /// While the closure is active, perform database work only through its ``UnitOfWork``.
+    /// Returning normally commits and promotes staged snapshots into the session identity map;
+    /// throwing rolls back and discards them. A transaction executor failure makes the unit of
+    /// work rollback-only even when the closure catches that original error.
+    ///
+    /// - Throws: ``SessionError/sessionBusy`` if direct session I/O or another unit of work is
+    ///   already active.
     public func withUnitOfWork<T: Sendable>(
         _ body: @Sendable (UnitOfWork) async throws -> T
     ) async throws -> T {

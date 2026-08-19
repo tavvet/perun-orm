@@ -2,6 +2,7 @@ import PerunDBAL
 
 /// PostgreSQL rendering policy.
 public struct PostgresDialect: SQLDialect {
+    /// PostgreSQL features used by the portable renderer and ORM.
     public let capabilities: DialectCapabilities = [
         .returning,
         .nativeBoolean,
@@ -9,8 +10,10 @@ public struct PostgresDialect: SQLDialect {
         .nativeUUID,
     ]
 
+    /// Creates a stateless PostgreSQL rendering policy.
     public init() {}
 
+    /// Returns PostgreSQL's one-based `$n` placeholder.
     public func placeholder(at position: Int) -> String {
         precondition(position > 0, "placeholder positions are one-based")
         return "$\(position)"

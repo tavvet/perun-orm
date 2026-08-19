@@ -2,25 +2,41 @@ import Foundation
 
 /// The portable column vocabulary shared by DBAL and ORM in v0.1.
 public enum ColumnType: Sendable, Hashable {
+    /// A boolean value.
     case boolean
+    /// A signed 32-bit integer.
     case int32
+    /// A signed 64-bit integer.
     case int64
+    /// An IEEE-754 double-precision value.
     case double
+    /// Unicode text.
     case text
+    /// Arbitrary bytes.
     case blob
+    /// A microsecond-precision timestamp.
     case timestamp
+    /// A UUID value.
     case uuid
 }
 
 /// A semantic value at the neutral DBAL boundary.
 public enum SQLValue: Sendable, Hashable {
+    /// SQL `NULL` without an intrinsic column type.
     case null
+    /// A boolean value.
     case bool(Bool)
+    /// A signed integer represented at the neutral boundary as `Int64`.
     case int(Int64)
+    /// A double-precision value.
     case double(Double)
+    /// Unicode text.
     case text(String)
+    /// Arbitrary bytes.
     case blob([UInt8])
+    /// A lossless portable timestamp.
     case date(SQLTimestamp)
+    /// A UUID value.
     case uuid(UUID)
 }
 
@@ -37,10 +53,17 @@ public struct SQLTimestamp: Sendable, Hashable {
     private static let maximumPortableMicrosecondsExclusive: Int64 = 253_402_300_800_000_000
     private let storage: Storage
 
+    /// Creates a timestamp from exact microseconds since the Unix epoch.
+    ///
+    /// Portable range validation occurs when the value is bound to a database.
     public init(microsecondsSinceUnixEpoch: Int64) {
         storage = .microsecondsSinceUnixEpoch(microsecondsSinceUnixEpoch)
     }
 
+    /// Converts a Foundation `Date` to rounded Unix-epoch microseconds.
+    ///
+    /// Non-finite and unrepresentable inputs are retained as an invalid state and rejected by
+    /// portable binding.
     public init(_ date: Date) {
         let referenceSeconds = date.timeIntervalSinceReferenceDate
         guard referenceSeconds.isFinite else {
@@ -59,6 +82,7 @@ public struct SQLTimestamp: Sendable, Hashable {
         storage = overflow ? .outOfRange : .microsecondsSinceUnixEpoch(unixMicroseconds)
     }
 
+    /// Exact microseconds since the Unix epoch, or `nil` for an invalid `Date` input.
     public var microsecondsSinceUnixEpoch: Int64? {
         guard case let .microsecondsSinceUnixEpoch(value) = storage else {
             return nil
@@ -109,15 +133,23 @@ public struct SQLTimestamp: Sendable, Hashable {
     }
 }
 
+/// Failures converting between a semantic ``SQLValue`` and a requested Swift type.
 public enum SQLValueConversionError: Error, Sendable, Equatable {
+    /// The semantic value does not match the requested portable column type.
     case typeMismatch(expected: ColumnType, actual: SQLValue)
+    /// The semantic value cannot fit in the requested Swift target type.
     case outOfRange(target: String, actual: SQLValue)
+    /// Foundation cannot represent the exact portable timestamp without precision loss.
     case timestampNotRepresentable(microsecondsSinceUnixEpoch: Int64)
 }
 
+/// Values rejected before backend-specific binding because they are not portable.
 public enum SQLValueBindingError: Error, Sendable, Equatable {
+    /// IEEE NaN has no supported portable database representation.
     case notANumber
+    /// A timestamp was created from a non-finite Foundation `Date`.
     case nonFiniteTimestamp
+    /// A timestamp lies outside the shared backend range.
     case timestampOutOfRange
 }
 
@@ -139,10 +171,14 @@ public extension SQLValue {
 
 /// Converts between a portable Swift value and its semantic DBAL representation.
 public protocol SQLValueConvertible: Sendable {
+    /// The portable schema type used for values of this Swift type.
     static var columnType: ColumnType { get }
+    /// Whether this Swift type accepts and emits SQL `NULL`.
     static var isNullable: Bool { get }
 
+    /// The semantic DBAL representation of this value.
     var sqlValue: SQLValue { get }
+    /// Creates a Swift value from its strict semantic DBAL representation.
     init(sqlValue: SQLValue) throws
 }
 
