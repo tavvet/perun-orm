@@ -114,6 +114,7 @@ public actor Session {
     private let database: any Database
     private var validatedSchemas: [ObjectIdentifier: Any] = [:]
     private var identity: [EntityKey: ManagedEntitySnapshot] = [:]
+    private var identityRevision: UInt64 = 0
     private var activeUnitOfWork: UUID?
     private var activeDatabaseOperations = 0
 
@@ -122,9 +123,12 @@ public actor Session {
     }
 
     /// Raw positional SQL escape hatch outside a unit of work.
+    /// Its unknown effect invalidates managed snapshots before and after execution.
     public func execute(_ sql: String, _ parameters: [SQLValue] = []) async throws -> ExecResult {
         try beginDirectDatabaseOperation()
         defer { endDirectDatabaseOperation() }
+        invalidateIdentity()
+        defer { invalidateIdentity() }
         return try await database.execute(sql, parameters)
     }
 
@@ -146,6 +150,7 @@ public actor Session {
             return try schema.materialize(from: cached.mappedValues)
         }
 
+        let revision = identityRevision
         let rendered = try SQLRenderer(dialect: database.dialect).render(
             schema.findStatement(primaryKey: primaryKey)
         )
@@ -168,7 +173,9 @@ public actor Session {
                 actual: hydratedPrimaryKey
             )
         }
-        identity[key] = snapshot
+        if identityRevision == revision {
+            identity[key] = snapshot
+        }
         return entity
     }
 
@@ -179,11 +186,32 @@ public actor Session {
 
         let schema = try validatedSchema(for: E.self)
         let rendered = try SQLRenderer(dialect: database.dialect).render(query.statement)
+        let revision = identityRevision
         let result = try await database.execute(rendered.sql, rendered.parameters)
         let batch = try hydrate(result.rows, schema: schema)
-        for (key, snapshot) in batch.snapshots {
-            identity[key] = snapshot
+        if identityRevision == revision {
+            for (key, snapshot) in batch.snapshots {
+                identity[key] = snapshot
+            }
         }
+        return batch.entities
+    }
+
+    /// Executes caller-owned SQL and atomically hydrates its rows as detached entities.
+    /// Raw SQL has an unknown effect, so no returned row becomes a managed snapshot.
+    public func fetch<E: Entity>(
+        _ type: E.Type,
+        sql: String,
+        params: [SQLValue] = []
+    ) async throws -> [E] {
+        try beginDirectDatabaseOperation()
+        defer { endDirectDatabaseOperation() }
+
+        let schema = try validatedSchema(for: type)
+        invalidateIdentity()
+        defer { invalidateIdentity() }
+        let result = try await database.execute(sql, params)
+        let batch = try hydrate(result.rows, schema: schema)
         return batch.entities
     }
 
@@ -236,7 +264,7 @@ public actor Session {
         }
 
         if outcome.changes.invalidatesIdentity {
-            identity.removeAll(keepingCapacity: true)
+            invalidateIdentity()
         }
         for (key, state) in outcome.changes.entities {
             switch state {
@@ -259,6 +287,11 @@ public actor Session {
     private func endDirectDatabaseOperation() {
         precondition(activeDatabaseOperations > 0)
         activeDatabaseOperations -= 1
+    }
+
+    private func invalidateIdentity() {
+        identityRevision &+= 1
+        identity.removeAll(keepingCapacity: true)
     }
 
     private func validatedSchema<E: Entity>(for type: E.Type) throws -> EntitySchema<E> {
@@ -336,6 +369,14 @@ public actor Session {
         try validateUnitOfWork(token)
         let schema = try validatedSchema(for: type)
         return try hydrate(rows, schema: schema)
+    }
+
+    fileprivate func unitOfWorkValidateRawFetch<E: Entity>(
+        for type: E.Type,
+        token: UUID
+    ) throws {
+        try validateUnitOfWork(token)
+        _ = try validatedSchema(for: type)
     }
 
     fileprivate func unitOfWorkCountPlan<E: Entity>(
@@ -502,7 +543,7 @@ public actor Session {
 
     fileprivate func invalidateIdentityForUnitOfWork(token: UUID) {
         precondition(activeUnitOfWork == token)
-        identity.removeAll(keepingCapacity: true)
+        invalidateIdentity()
     }
 
     fileprivate func invalidateIdentityKeyForUnitOfWork(_ key: EntityKey, token: UUID) {
@@ -601,13 +642,7 @@ public actor UnitOfWork {
         }
 
         let result = try await executeTransaction(sql, parameters)
-        let shouldInvalidateBaseIdentity = !invalidatesSessionIdentity
-        invalidatesSessionIdentity = true
-        overlay.removeAll(keepingCapacity: true)
-        if shouldInvalidateBaseIdentity {
-            // Commit may succeed before its caller observes cancellation or a timeout.
-            await session.invalidateIdentityForUnitOfWork(token: token)
-        }
+        await invalidateSnapshotsAfterRawExecution()
         return result
     }
 
@@ -675,6 +710,41 @@ public actor UnitOfWork {
             overlay[key] = .snapshot(snapshot)
         }
         return batch.entities
+    }
+
+    /// Executes caller-owned SQL and atomically hydrates detached entities in this transaction.
+    /// Because the statement may write, post-execution hydration errors force rollback.
+    public func fetch<E: Entity>(
+        _ type: E.Type,
+        sql: String,
+        params: [SQLValue] = []
+    ) async throws -> [E] {
+        try beginOperation()
+        defer { endOperation() }
+
+        if let command = transactionControlCommand(in: sql) {
+            rollbackOnly = true
+            throw SessionError.transactionControlNotAllowed(command: command)
+        }
+
+        try await session.unitOfWorkValidateRawFetch(for: type, token: token)
+        var executionCompleted = false
+        do {
+            let result = try await executeTransaction(sql, params)
+            executionCompleted = true
+            await invalidateSnapshotsAfterRawExecution()
+            let batch = try await session.unitOfWorkHydrate(
+                result.rows,
+                as: type,
+                token: token
+            )
+            return batch.entities
+        } catch {
+            if executionCompleted {
+                rollbackOnly = true
+            }
+            throw error
+        }
     }
 
     /// Executes at most one transactional row and stages its identity snapshot.
@@ -937,6 +1007,16 @@ public actor UnitOfWork {
         } catch {
             rollbackOnly = true
             throw error
+        }
+    }
+
+    private func invalidateSnapshotsAfterRawExecution() async {
+        let shouldInvalidateBaseIdentity = !invalidatesSessionIdentity
+        invalidatesSessionIdentity = true
+        overlay.removeAll(keepingCapacity: true)
+        if shouldInvalidateBaseIdentity {
+            // COMMIT may succeed before its caller observes cancellation or a timeout.
+            await session.invalidateIdentityForUnitOfWork(token: token)
         }
     }
 

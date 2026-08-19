@@ -470,6 +470,13 @@ private func runSharedORMQueryConformance(database: any Database) async throws {
         let schema = try EntitySchema(ORMQueryRecord.self)
         let createTable = try renderer.render(schema.createTableStatement)
         _ = try await database.execute(createTable.sql, createTable.parameters)
+        let rawColumns = schema.fields
+            .map { dialect.quoteIdentifier($0.column) }
+            .joined(separator: ", ")
+        let rawByIDSQL = "SELECT \(rawColumns) FROM \(table) "
+            + "WHERE \(dialect.quoteIdentifier("id")) = \(dialect.placeholder(at: 1))"
+        let rawAllSQL = "SELECT \(rawColumns) FROM \(table) "
+            + "ORDER BY \(dialect.quoteIdentifier("id")) ASC"
 
         let first = ORMQueryRecord(
             id: 1,
@@ -591,6 +598,13 @@ private func runSharedORMQueryConformance(database: any Database) async throws {
             #expect(try await unitOfWork.find(ORMQueryRecord.self, first.id) == updatedFirst)
             #expect(try await unitOfWork.find(ORMQueryRecord.self, second.id) == nil)
             #expect(try await unitOfWork.find(ORMQueryRecord.self, fourth.id) == fourth)
+            #expect(
+                try await unitOfWork.fetch(
+                    ORMQueryRecord.self,
+                    sql: rawByIDSQL,
+                    params: [.int(refreshedThird.id)]
+                ) == [refreshedThird]
+            )
             return rows
         }
         #expect(transactionalRows == [updatedFirst, refreshedThird, fourth])
@@ -601,6 +615,10 @@ private func runSharedORMQueryConformance(database: any Database) async throws {
         let freshSession = Session(database: database)
         #expect(
             try await freshSession.fetch(allQuery)
+                == [updatedFirst, refreshedThird, fourth]
+        )
+        #expect(
+            try await freshSession.fetch(ORMQueryRecord.self, sql: rawAllSQL)
                 == [updatedFirst, refreshedThird, fourth]
         )
         #expect(try await freshSession.count(allQuery.limit(0)) == 3)

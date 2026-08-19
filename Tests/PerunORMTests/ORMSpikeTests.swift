@@ -82,6 +82,13 @@ func unitOfWorkOwnsTheTransactionAndClosesAfterTheBody() async throws {
         }
 
         do {
+            _ = try await session.fetch(User.self, sql: "raw-outside")
+            Issue.record("session raw fetch unexpectedly entered an active unit of work")
+        } catch let error as SessionError {
+            #expect(error == .sessionBusy)
+        }
+
+        do {
             _ = try await session.first(query)
             Issue.record("session first unexpectedly entered an active unit of work")
         } catch let error as SessionError {
