@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Build, test, and document with Swift 6.0
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.0.app/Contents/Developer
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Install native dependencies
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+
+          brew install openssl@3 postgresql@17
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: swift build --explicit-target-dependency-import-check error
+
+      - name: Set up PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          postgres_bin="$(brew --prefix postgresql@17)/bin"
+          brew services start postgresql@17
+
+          for _ in {1..30}; do
+            if "$postgres_bin/pg_isready" --host localhost --port 5432; then
+              break
+            fi
+            sleep 1
+          done
+          "$postgres_bin/pg_isready" --host localhost --port 5432
+
+          "$postgres_bin/psql" --dbname postgres \
+            --command "CREATE ROLE perun LOGIN PASSWORD 'perun';"
+          "$postgres_bin/createdb" --owner perun perun
+
+      - name: Test
+        env:
+          PERUN_PGSQL_INTEGRATION: "1"
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: perun
+          PGDATABASE: perun
+          PGPASSWORD: perun
+          PGSSLMODE: disable
+        run: swift test
+
+      - name: Build documentation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          swift package dump-symbol-graph
+
+          symbol_graph_root="$(find .build -type d -path '*/symbolgraph' -print -quit)"
+          test -n "$symbol_graph_root"
+          mkdir -p .build/docc-symbols .build/docc
+
+          for module in PerunDBAL PerunDBALPostgres PerunDBALSQLite PerunORM; do
+            module_symbols=".build/docc-symbols/$module"
+            module_archive=".build/docc/$module.doccarchive"
+
+            mkdir -p "$module_symbols"
+            find "$symbol_graph_root" -maxdepth 1 -type f \
+              \( -name "$module.symbols.json" -o -name "$module@*.symbols.json" \) \
+              -exec cp {} "$module_symbols/" \;
+            test -f "$module_symbols/$module.symbols.json"
+
+            xcrun docc convert \
+              --additional-symbol-graph-dir "$module_symbols" \
+              --output-path "$module_archive" \
+              --warnings-as-errors
+          done
