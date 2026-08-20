@@ -1,0 +1,24 @@
+{
+  "originHash" : "9b33281d1863ad6d33962e9b858e2224efb0e506c04359ef3029f7a402c640da",
+  "pins" : [
+    {
+      "identity" : "perun-pgsql",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/tavvet/perun-pgsql.git",
+      "state" : {
+        "revision" : "94d616539337f22d6be10bca48a5faf0495e084a",
+        "version" : "0.3.0"
+      }
+    },
+    {
+      "identity" : "perun-sqlite",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/tavvet/perun-sqlite.git",
+      "state" : {
+        "revision" : "bd6e53b990d6924f0f099af2a85d83577f1052b8",
+        "version" : "0.2.0"
+      }
+    }
+  ],
+  "version" : 3
+}
