@@ -86,7 +86,13 @@ jobs:
           test -n "$symbol_graph_root"
           mkdir -p .build/docc-catalogs .build/docc-symbols .build/docc
 
-          for module in PerunDBAL PerunDBALPostgres PerunDBALSQLite PerunORM; do
+          for module in \
+            PerunDBAL \
+            PerunDBALPostgres \
+            PerunDBALSQLite \
+            PerunMigrations \
+            PerunORM
+          do
             module_catalog=".build/docc-catalogs/$module.docc"
             module_symbols=".build/docc-symbols/$module"
             module_archive=".build/docc/$module.doccarchive"
