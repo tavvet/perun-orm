@@ -129,7 +129,7 @@ struct MigrationPlan: Sendable {
         for (index, migration) in migrations.enumerated() {
             let position = Int64(index) + 1
 
-            guard Self.isValidMigrationID(migration.id) else {
+            guard MigrationValidation.isValidMigrationID(migration.id) else {
                 throw MigrationPlanError.invalidMigrationID(
                     position: position,
                     id: migration.id
@@ -160,7 +160,7 @@ struct MigrationPlan: Sendable {
             )
         }
 
-        guard Self.isValidTrackingTableName(trackingTableName) else {
+        guard MigrationValidation.isValidTrackingTableName(trackingTableName) else {
             throw MigrationPlanError.invalidTrackingTableName(trackingTableName)
         }
 
@@ -199,7 +199,18 @@ struct MigrationPlan: Sendable {
         )
     }
 
-    private static func isValidMigrationID(_ id: String) -> Bool {
+    private static func fnv1a64(_ value: String) -> Int64 {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 1_099_511_628_211
+        }
+        return Int64(bitPattern: hash)
+    }
+}
+
+enum MigrationValidation {
+    static func isValidMigrationID(_ id: String) -> Bool {
         let bytes = id.utf8
         guard (1 ... 128).contains(bytes.count), let first = bytes.first else {
             return false
@@ -212,7 +223,7 @@ struct MigrationPlan: Sendable {
         }
     }
 
-    private static func isValidTrackingTableName(_ name: String) -> Bool {
+    static func isValidTrackingTableName(_ name: String) -> Bool {
         let bytes = name.utf8
         guard (1 ... 63).contains(bytes.count), let first = bytes.first else {
             return false
@@ -242,14 +253,5 @@ struct MigrationPlan: Sendable {
 
     private static func isASCIIDigit(_ byte: UInt8) -> Bool {
         (0x30 ... 0x39).contains(byte)
-    }
-
-    private static func fnv1a64(_ value: String) -> Int64 {
-        var hash: UInt64 = 14_695_981_039_346_656_037
-        for byte in value.utf8 {
-            hash ^= UInt64(byte)
-            hash = hash &* 1_099_511_628_211
-        }
-        return Int64(bitPattern: hash)
     }
 }

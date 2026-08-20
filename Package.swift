@@ -59,7 +59,14 @@ let package = Package(
         ),
         .testTarget(
             name: "PerunMigrationsTests",
-            dependencies: ["PerunMigrations"]
+            dependencies: [
+                "PerunDBAL",
+                "PerunDBALPostgres",
+                "PerunDBALSQLite",
+                "PerunMigrations",
+                .product(name: "PerunPGSQL", package: "perun-pgsql"),
+                .product(name: "PerunSQLite", package: "perun-sqlite"),
+            ]
         ),
         .testTarget(
             name: "PerunORMTests",

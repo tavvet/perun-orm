@@ -36,6 +36,14 @@ public struct SQLiteDialect: SQLDialect {
         "\(quoteIdentifier(name)) INTEGER PRIMARY KEY"
     }
 
+    public func createTableHead(ifNotExists: Bool) -> String {
+        if ifNotExists {
+            "CREATE TABLE IF NOT EXISTS"
+        } else {
+            "CREATE TABLE"
+        }
+    }
+
     public func paginationPlan(
         limit: Int,
         offset: Int?,

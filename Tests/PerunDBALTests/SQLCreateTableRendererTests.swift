@@ -69,6 +69,69 @@ func createTableRendererDelegatesTheWholeGeneratedPrimaryKeyPhrase() throws {
 }
 
 @Test
+func createTableRendererUsesConditionalCreateSupportedByAdapters() throws {
+    let createTable = SQLCreateTable(
+        table: "migration_history",
+        columns: [SQLColumnDefinition(name: "position", type: .int64)],
+        ifNotExists: true
+    )
+
+    let postgres = try SQLRenderer(dialect: PostgresDialect()).render(createTable)
+    #expect(
+        postgres == RenderedSQL(
+            sql: "CREATE TABLE IF NOT EXISTS \"migration_history\" (\"position\" BIGINT NOT NULL)",
+            parameters: []
+        )
+    )
+
+    let sqlite = try SQLRenderer(dialect: SQLiteDialect()).render(createTable)
+    #expect(
+        sqlite == RenderedSQL(
+            sql: "CREATE TABLE IF NOT EXISTS \"migration_history\" (\"position\" BIGINT NOT NULL)",
+            parameters: []
+        )
+    )
+}
+
+@Test
+func createTableRendererUsesSourceCompatibleDefaultDialectHead() throws {
+    let renderer = SQLRenderer(dialect: DefaultCreateTableDialect())
+    let columns = [SQLColumnDefinition(name: "position", type: .int64)]
+
+    let unconditional = try renderer.render(
+        SQLCreateTable(table: "migration_history", columns: columns)
+    )
+    #expect(
+        unconditional.sql == "CREATE TABLE \"migration_history\" (\"position\" BIGINT NOT NULL)"
+    )
+
+    #expect(throws: SQLDialectFeatureError.createTableIfNotExistsUnsupported) {
+        try renderer.render(
+            SQLCreateTable(
+                table: "migration_history",
+                columns: columns,
+                ifNotExists: true
+            )
+        )
+    }
+}
+
+@Test
+func createTableInitializerReferenceRemainsSourceCompatible() {
+    let makeCreateTable: (String, [SQLColumnDefinition]) -> SQLCreateTable =
+        SQLCreateTable.init(table:columns:)
+
+    let createTable = makeCreateTable(
+        "migration_history",
+        [SQLColumnDefinition(name: "position", type: .int64)]
+    )
+
+    #expect(createTable.table == "migration_history")
+    #expect(createTable.columns.count == 1)
+    #expect(!createTable.ifNotExists)
+}
+
+@Test
 func createTableRendererRejectsStructurallyInvalidStatements() {
     let renderer = SQLRenderer(dialect: SQLiteDialect())
     let attribute = SQLColumnDefinition(name: "value", type: .text)
@@ -159,4 +222,10 @@ func createTableRendererRejectsStructurallyInvalidStatements() {
             )
         )
     }
+}
+
+private struct DefaultCreateTableDialect: SQLDialect {
+    let capabilities: DialectCapabilities = []
+
+    func placeholder(at position: Int) -> String { ":\(position)" }
 }
