@@ -116,6 +116,26 @@ func unitOfWorkOwnsTheTransactionAndClosesAfterTheBody() async throws {
 }
 
 @Test
+func escapedUnitOfWorkReleasesItsClosedExecutionContext() async throws {
+    let lifetime = TransactionLifetimeRecorder()
+    let session = Session(database: LifetimeDatabase(lifetime: lifetime))
+
+    let escapedUnitOfWork = try await session.withUnitOfWork { unitOfWork in
+        _ = try await unitOfWork.execute("inside")
+        return unitOfWork
+    }
+
+    do {
+        _ = try await escapedUnitOfWork.execute("escaped")
+        Issue.record("escaped unit of work remained usable")
+    } catch let error as SessionError {
+        #expect(error == .unitOfWorkClosed)
+    }
+
+    #expect(await lifetime.transactionWasReleased)
+}
+
+@Test
 func unitOfWorkRejectsOverlapAndWaitsForAnOperationThatAlreadyStarted() async throws {
     let gate = OperationGate()
     let recorder = Recorder()
@@ -484,6 +504,61 @@ private struct FakeTransaction: Transaction {
         await recorder.record(sql)
         return ExecResult(rowsAffected: 0)
     }
+}
+
+private final class TransactionLifetimeProbe: Sendable {}
+
+private actor TransactionLifetimeRecorder {
+    private weak var transactionProbe: TransactionLifetimeProbe?
+
+    var transactionWasReleased: Bool {
+        transactionProbe == nil
+    }
+
+    func makeTransaction() -> LifetimeTransaction {
+        let probe = TransactionLifetimeProbe()
+        transactionProbe = probe
+        return LifetimeTransaction(probe: probe)
+    }
+}
+
+private struct LifetimeTransaction: Transaction {
+    private let probe: TransactionLifetimeProbe
+
+    init(probe: TransactionLifetimeProbe) {
+        self.probe = probe
+    }
+
+    func execute(
+        _ sql: String,
+        _ parameters: [SQLValue],
+        intent: ExecutionIntent
+    ) async throws -> ExecResult {
+        _ = probe
+        return ExecResult(rowsAffected: 0)
+    }
+}
+
+private struct LifetimeDatabase: Database {
+    let lifetime: TransactionLifetimeRecorder
+
+    var dialect: any SQLDialect { FakeDialect() }
+
+    func execute(
+        _ sql: String,
+        _ parameters: [SQLValue],
+        intent: ExecutionIntent
+    ) async throws -> ExecResult {
+        ExecResult(rowsAffected: 0)
+    }
+
+    func withTransaction<T: Sendable>(
+        _ body: @Sendable (any Transaction) async throws -> T
+    ) async throws -> T {
+        try await body(await lifetime.makeTransaction())
+    }
+
+    func shutdown() async {}
 }
 
 private struct FakeDatabase: Database {

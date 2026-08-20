@@ -5,6 +5,26 @@ All notable changes to PerunORM are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-21
+
+This patch release fixes resource retention after a unit of work leaves its transaction closure.
+
+### Fixed
+
+- A closed escaped `UnitOfWork` now releases its transaction and session execution context after
+  draining operations already in flight, while continuing to reject all later calls.
+
+### Changed
+
+- Split session planning, state, and unit-of-work execution into focused source files without
+  changing the public API.
+- Documented the intended framework lifecycle: application-owned database/pool, request- or
+  command-scoped `Session`, and closure-scoped `UnitOfWork`.
+
+### Compatibility
+
+- Source compatible with 0.2.0; no public symbols were added, removed, or changed.
+
 ## [0.2.0] - 2026-08-20
 
 This release adds forward-only, transactional database migrations for PostgreSQL and SQLite.
@@ -116,5 +136,6 @@ First public release of PerunORM.
 - SQLite does not advertise `RETURNING` support in 0.1. Generated integer keys use the driver's
   last-inserted-row-ID path followed by a lookup in the same transaction.
 
+[0.2.1]: https://github.com/tavvet/perun-orm/compare/0.2.0...0.2.1
 [0.2.0]: https://github.com/tavvet/perun-orm/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/tavvet/perun-orm/releases/tag/0.1.0

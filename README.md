@@ -334,6 +334,9 @@ await database.shutdown()
 
 ### Sessions and units of work
 
+- Keep the database/pool application-scoped, create a fresh `Session` for each request or command,
+  and use `UnitOfWork` only inside its closure. A global session would retain identity snapshots
+  across unrelated work; a session-local schema cache is intentionally rebuilt for a new session.
 - `Session` and `UnitOfWork` are actors.
 - Direct session operations may overlap; identity revisions prevent a late read from restoring
   a snapshot invalidated by raw SQL.
@@ -344,6 +347,8 @@ await database.shutdown()
 - Unit-of-work operations are strictly serial. An overlapping call fails with
   `SessionError.unitOfWorkBusy`.
 - Any transaction executor failure makes the unit of work rollback-only.
+- A closed `UnitOfWork` rejects later calls and releases its transaction/session execution context,
+  even if the caller retained the handle.
 - A raw hydration failure after execution also forces rollback because the SQL may have been DML
   with `RETURNING`.
 - Entities and directly mapped fields must have value semantics.
