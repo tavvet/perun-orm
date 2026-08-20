@@ -55,6 +55,78 @@ func metadataStoreRendersExactSQLiteTrackingStatements() async throws {
 }
 
 @Test
+func metadataStoreRendersExactPostgresTrackingInsert() async throws {
+    let timestamp = SQLTimestamp(microsecondsSinceUnixEpoch: 1_700_000_000_123_456)
+    let (row, calls) = try await recordMetadataStoreInsert(
+        dialect: PostgresDialect(),
+        timestamp: timestamp
+    )
+
+    #expect(
+        row == MigrationMetadataRow(
+            reference: MigrationReference(
+                position: 7,
+                id: "007_backfill_users",
+                revision: 3
+            ),
+            appliedAt: timestamp
+        )
+    )
+    #expect(
+        calls == [
+            MetadataRecordedStatement(
+                sql: "INSERT INTO \"_perun_migrations\" "
+                    + "(\"position\", \"id\", \"revision\", \"applied_at\") "
+                    + "VALUES ($1, $2, $3, $4)",
+                parameters: [
+                    .int(7),
+                    .text("007_backfill_users"),
+                    .int(3),
+                    .date(timestamp),
+                ],
+                intent: .arbitrary
+            ),
+        ]
+    )
+}
+
+@Test
+func metadataStoreRendersExactSQLiteTrackingInsert() async throws {
+    let timestamp = SQLTimestamp(microsecondsSinceUnixEpoch: 1_700_000_000_123_456)
+    let (row, calls) = try await recordMetadataStoreInsert(
+        dialect: SQLiteDialect(),
+        timestamp: timestamp
+    )
+
+    #expect(
+        row == MigrationMetadataRow(
+            reference: MigrationReference(
+                position: 7,
+                id: "007_backfill_users",
+                revision: 3
+            ),
+            appliedAt: timestamp
+        )
+    )
+    #expect(
+        calls == [
+            MetadataRecordedStatement(
+                sql: "INSERT INTO \"_perun_migrations\" "
+                    + "(\"position\", \"id\", \"revision\", \"applied_at\") "
+                    + "VALUES (?, ?, ?, ?)",
+                parameters: [
+                    .int(7),
+                    .text("007_backfill_users"),
+                    .int(3),
+                    .date(timestamp),
+                ],
+                intent: .arbitrary
+            ),
+        ]
+    )
+}
+
+@Test
 func metadataStoreDecodesMultipleRowsWithLosslessTimestamps() throws {
     let minimum = SQLTimestamp(microsecondsSinceUnixEpoch: -62_135_596_800_000_000)
     let maximum = SQLTimestamp(microsecondsSinceUnixEpoch: 253_402_300_799_999_999)
@@ -318,6 +390,29 @@ private func recordMetadataStoreStatements(
     _ = try await store.readSnapshot(using: transaction)
 
     return await state.recordedStatements()
+}
+
+private func recordMetadataStoreInsert(
+    dialect: any SQLDialect,
+    timestamp: SQLTimestamp
+) async throws -> (MigrationMetadataRow, [MetadataRecordedStatement]) {
+    let state = MetadataRecordingState(results: [ExecResult(rowsAffected: 1)])
+    let transaction = MetadataRecordingTransaction(state: state)
+    let store = MigrationMetadataStore(
+        tableName: "_perun_migrations",
+        dialect: dialect
+    )
+    let row = try await store.insert(
+        reference: MigrationReference(
+            position: 7,
+            id: "007_backfill_users",
+            revision: 3
+        ),
+        appliedAt: timestamp,
+        using: transaction
+    )
+
+    return (row, await state.recordedStatements())
 }
 
 private struct MetadataRecordedStatement: Sendable, Equatable {

@@ -47,6 +47,12 @@ public enum ExecutionIntent: Sendable, Hashable {
 }
 
 /// Something capable of executing already-rendered positional SQL.
+///
+/// Each execution accepts exactly one meaningful top-level SQL statement. An implementation
+/// must reject input containing no meaningful statement, and must reject more than one before
+/// executing the first statement. This requirement is independent of whether the parameter list
+/// is empty; empty parameters must not select a batch-capable execution path. It does not make
+/// backend statement preparation or other session-scoped effects transactional.
 public protocol SQLExecutor: Sendable {
     /// Executes one caller-rendered statement with parameters in placeholder order.
     ///
@@ -70,7 +76,9 @@ public extension SQLExecutor {
 /// supplied it.
 ///
 /// A transaction must reject or otherwise safely fail operations attempted after that body
-/// returns. It intentionally cannot create nested transactions.
+/// returns. Every execution has the same exactly-one-statement and reject-before-first-execution
+/// requirements as ``SQLExecutor``, including for an empty parameter list. A transaction
+/// intentionally cannot create nested transactions.
 public protocol Transaction: SQLExecutor {}
 
 /// A logical database façade, normally backed by a connection pool.

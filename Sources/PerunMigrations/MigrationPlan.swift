@@ -88,6 +88,7 @@ public struct MigrationReport: Sendable, Equatable {
 public struct Migrator: Sendable {
     let database: any ExclusiveTransactionDatabase
     let plan: MigrationPlan
+    let clock: MigrationClock
 
     /// Creates a migrator after synchronously validating its complete local plan.
     ///
@@ -105,11 +106,26 @@ public struct Migrator: Sendable {
         migrations: [Migration],
         trackingTableName: String = "_perun_migrations"
     ) throws {
+        try self.init(
+            database: database,
+            migrations: migrations,
+            trackingTableName: trackingTableName,
+            clock: .system
+        )
+    }
+
+    init(
+        database: any ExclusiveTransactionDatabase,
+        migrations: [Migration],
+        trackingTableName: String = "_perun_migrations",
+        clock: MigrationClock
+    ) throws {
         self.database = database
         plan = try MigrationPlan(
             migrations: migrations,
             trackingTableName: trackingTableName
         )
+        self.clock = clock
     }
 }
 

@@ -100,6 +100,39 @@ struct MigrationMetadataStore: Sendable {
         return try decodeSnapshot(result.rows)
     }
 
+    func insert(
+        reference: MigrationReference,
+        appliedAt: SQLTimestamp,
+        using transaction: any Transaction
+    ) async throws -> MigrationMetadataRow {
+        try SQLValue.date(appliedAt).validateForPortableBinding()
+        let statement = try renderer.render(
+            SQLInsert(
+                table: tableName,
+                values: [
+                    SQLColumnValue(
+                        column: Self.positionColumn,
+                        value: .int(reference.position)
+                    ),
+                    SQLColumnValue(
+                        column: Self.idColumn,
+                        value: .text(reference.id)
+                    ),
+                    SQLColumnValue(
+                        column: Self.revisionColumn,
+                        value: .int(reference.revision)
+                    ),
+                    SQLColumnValue(
+                        column: Self.appliedAtColumn,
+                        value: .date(appliedAt)
+                    ),
+                ]
+            )
+        )
+        _ = try await transaction.execute(statement.sql, statement.parameters)
+        return MigrationMetadataRow(reference: reference, appliedAt: appliedAt)
+    }
+
     func decodeSnapshot(_ rows: [any Row]) throws -> MigrationMetadataSnapshot {
         var decodedRows: [MigrationMetadataRow] = []
         decodedRows.reserveCapacity(rows.count)

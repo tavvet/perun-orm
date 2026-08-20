@@ -14,6 +14,14 @@ public enum PostgresAdapterError: Error, Sendable, Equatable {
     case unsupportedResultFormat(column: String, formatCode: Int16)
 }
 
+/// Failures found while validating caller-supplied PostgreSQL statements before execution.
+public struct PostgresStatementError: Error, Sendable, Equatable {
+    /// The SQL contains only whitespace, semicolons, UTF-8 byte-order marks, or comments.
+    public static let emptyStatement = PostgresStatementError()
+
+    private init() {}
+}
+
 /// DBAL façade over the standalone PostgreSQL connection pool.
 public struct PostgresDatabase: ExclusiveTransactionDatabase {
     private let client: PostgresClient
@@ -55,6 +63,9 @@ public struct PostgresDatabase: ExclusiveTransactionDatabase {
         _ parameters: [SQLValue],
         intent: ExecutionIntent
     ) async throws -> ExecResult {
+        guard sqlContainsMeaningfulStatement(in: sql) else {
+            throw PostgresStatementError.emptyStatement
+        }
         let result = try await client.query(
             sql,
             try postgresParameters(parameters),
@@ -121,6 +132,9 @@ private struct PostgresTransaction: Transaction {
         _ parameters: [SQLValue],
         intent: ExecutionIntent
     ) async throws -> ExecResult {
+        guard sqlContainsMeaningfulStatement(in: sql) else {
+            throw PostgresStatementError.emptyStatement
+        }
         let result = try await base.query(
             sql,
             try postgresParameters(parameters),

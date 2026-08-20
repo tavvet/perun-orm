@@ -20,7 +20,7 @@ hatches when the typed surface is not enough.
 | `PerunDBAL` | Backend-neutral values, rows, SQL AST, rendering, and execution protocols |
 | `PerunDBALPostgres` | PostgreSQL database façade and dialect |
 | `PerunDBALSQLite` | SQLite database façade and dialect |
-| `PerunMigrations` | Forward-only migration planning and status, under development for 0.2 |
+| `PerunMigrations` | Atomic forward-only migrations and status, under development for 0.2 |
 | `PerunORM` | Entity mapping, sessions, typed queries, and unit-of-work CRUD |
 
 ## Installation
