@@ -70,7 +70,7 @@ public enum SQLiteAdapterError: Error, Sendable, Equatable {
 }
 
 /// DBAL façade over the standalone SQLite connection pool.
-public struct SQLiteDatabase: Database {
+public struct SQLiteDatabase: ExclusiveTransactionDatabase {
     /// Default pool capacity used by the configuration initializer.
     public static let defaultMaxConnections = 1
 
@@ -93,9 +93,9 @@ public struct SQLiteDatabase: Database {
     /// A single connection is the safe default, especially for `SQLiteConfiguration.memory()`,
     /// whose database is private to one connection. A private in-memory database also vanishes when
     /// that connection is recycled, so keep `maxConnectionLifetime` and `maxIdleTime` set to `nil`.
-    /// A shared-cache in-memory URI permits a larger pool but still vanishes when its last connection
-    /// closes. Use a file database before enabling connection recycling, and be prepared for
-    /// SQLite's locking semantics when using more than one connection.
+    /// A shared-cache in-memory URI permits a larger pool but still vanishes when its last
+    /// connection closes. Use a file database before enabling connection recycling, and be prepared
+    /// for SQLite's locking semantics when using more than one connection.
     ///
     /// - Precondition: `maxConnections` is greater than zero.
     public init(
@@ -130,6 +130,24 @@ public struct SQLiteDatabase: Database {
     ) async throws -> T {
         try await client.withTransaction { transaction in
             try await body(SQLiteTransaction(base: transaction))
+        }
+    }
+
+    /// Executes `body` after acquiring SQLite's database-wide write reservation.
+    ///
+    /// SQLite permits only one writer, so every lock key shares the same native lock. This is
+    /// stronger serialization than the portable contract requires and keeps the reservation tied
+    /// to the transaction's commit or rollback. A waiting `BEGIN IMMEDIATE` establishes its
+    /// transaction only after the previous writer finishes, so `body` does not inherit a pre-lock
+    /// read snapshot. Cancellation that arrives while waiting is checked before `body` begins.
+    public func withExclusiveTransaction<T: Sendable>(
+        lockKey: DatabaseLockKey,
+        _ body: @Sendable (any Transaction) async throws -> T
+    ) async throws -> T {
+        _ = lockKey
+        return try await client.withTransaction(kind: .immediate) { transaction in
+            try Task.checkCancellation()
+            return try await body(SQLiteTransaction(base: transaction))
         }
     }
 

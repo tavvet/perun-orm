@@ -15,7 +15,7 @@ public enum PostgresAdapterError: Error, Sendable, Equatable {
 }
 
 /// DBAL façade over the standalone PostgreSQL connection pool.
-public struct PostgresDatabase: Database {
+public struct PostgresDatabase: ExclusiveTransactionDatabase {
     private let client: PostgresClient
 
     /// The rendering policy paired with this database executor.
@@ -70,6 +70,40 @@ public struct PostgresDatabase: Database {
     ) async throws -> T {
         try await client.withTransaction { transaction in
             try await body(PostgresTransaction(base: transaction))
+        }
+    }
+
+    /// Executes `body` at `READ COMMITTED` after acquiring a transaction-scoped PostgreSQL
+    /// advisory lock.
+    public func withExclusiveTransaction<T: Sendable>(
+        lockKey: DatabaseLockKey,
+        _ body: @Sendable (any Transaction) async throws -> T
+    ) async throws -> T {
+        try await client.withTransaction { transaction in
+            let dbalTransaction = PostgresTransaction(base: transaction)
+            // The advisory-lock SELECT is the first snapshot-taking statement. Force
+            // READ COMMITTED before it so a waiter sees the previous holder's commit after
+            // acquiring the lock even when the session default is REPEATABLE READ or SERIALIZABLE.
+            _ = try await dbalTransaction.execute(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                [],
+                intent: .arbitrary
+            )
+            _ = try await dbalTransaction.execute(
+                "SELECT pg_advisory_xact_lock($1::bigint)",
+                [.int(lockKey.rawValue)],
+                intent: .arbitrary
+            )
+            let result = try await body(dbalTransaction)
+            // PostgreSQL keeps a transaction aborted after a server statement error even if the
+            // body catches that error. Probe before COMMIT so the driver rolls back and reports
+            // the failed transaction instead of accepting PostgreSQL's ROLLBACK command tag.
+            _ = try await dbalTransaction.execute(
+                "SELECT 1",
+                [],
+                intent: .arbitrary
+            )
+            return result
         }
     }
 

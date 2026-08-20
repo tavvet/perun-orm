@@ -66,7 +66,8 @@ public extension SQLExecutor {
     }
 }
 
-/// A closure-scoped executor that is valid only during its `Database.withTransaction` body.
+/// A closure-scoped executor valid only during the database-owned transaction body that
+/// supplied it.
 ///
 /// A transaction must reject or otherwise safely fail operations attempted after that body
 /// returns. It intentionally cannot create nested transactions.
@@ -98,6 +99,52 @@ public protocol Database: SQLExecutor {
     /// Implementations must make repeated calls safe. New work after shutdown fails with the
     /// underlying client's typed shutdown error.
     func shutdown() async
+}
+
+/// An application-defined identifier for mutually exclusive database work.
+///
+/// Equal raw values identify the same resource within one logical database. Backends may
+/// serialize different keys more strongly when they cannot provide independent lock namespaces.
+public struct DatabaseLockKey: Sendable, Hashable {
+    /// The backend-neutral signed 64-bit lock identifier.
+    public let rawValue: Int64
+
+    /// Creates a lock key from its stable application-defined value.
+    public init(rawValue: Int64) {
+        self.rawValue = rawValue
+    }
+}
+
+/// A database that can hold an exclusive lock for the complete lifetime of a transaction.
+///
+/// For one logical database, calls using equal lock keys must not execute their bodies
+/// concurrently. An implementation may serialize more keys, but never fewer. It must acquire the
+/// lock before invoking `body`, hold it through commit or rollback, and release it as part of that
+/// transaction's cleanup. Reads through the protected transaction must not use a database snapshot
+/// established before successful lock acquisition; they must be able to observe commits from
+/// equal-key calls completed before that acquisition. The supplied executor has the same
+/// closure-scoped lifetime as the one in ``Database/withTransaction(_:)``. The enclosing database
+/// owns the exclusive transaction boundary: `body` must not submit `BEGIN`, `COMMIT`, `ROLLBACK`,
+/// savepoint commands, or any other transaction-control SQL through that executor. Doing so
+/// violates this protocol contract, and implementations are not required to recover that
+/// transaction.
+///
+/// There is intentionally no fallback through ordinary ``Database/withTransaction(_:)`` because
+/// that protocol does not promise mutual exclusion across connections or façade instances.
+public protocol ExclusiveTransactionDatabase: Database {
+    /// Runs `body` in a transaction protected by `lockKey`.
+    ///
+    /// A normal return from this method means its transaction committed. If `body` throws, the
+    /// implementation rolls back and rethrows. Cancellation observed before commit begins also
+    /// rolls back and throws. An implementation may still reject the transaction after `body`
+    /// returns; commit failure or cancellation once commit begins may leave its outcome
+    /// indeterminate, but a known rollback must never be reported as success. The supplied
+    /// ``Transaction`` must not escape the closure, create a nested transaction, or submit
+    /// transaction-control SQL.
+    func withExclusiveTransaction<T: Sendable>(
+        lockKey: DatabaseLockKey,
+        _ body: @Sendable (any Transaction) async throws -> T
+    ) async throws -> T
 }
 
 /// Features that a paired dialect and executor can provide without unsafe emulation.
