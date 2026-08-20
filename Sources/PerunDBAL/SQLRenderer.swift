@@ -242,11 +242,23 @@ public struct SQLCreateTable: Sendable, Hashable {
     public let table: String
     /// Column definitions in declaration order.
     public let columns: [SQLColumnDefinition]
+    /// Whether creation should succeed without changing an already existing table.
+    public let ifNotExists: Bool
 
-    /// Creates a portable CREATE TABLE description.
+    /// Creates an unconditional portable CREATE TABLE description.
     public init(table: String, columns: [SQLColumnDefinition]) {
+        self.init(table: table, columns: columns, ifNotExists: false)
+    }
+
+    /// Creates a portable CREATE TABLE description with an explicit existence policy.
+    public init(
+        table: String,
+        columns: [SQLColumnDefinition],
+        ifNotExists: Bool
+    ) {
         self.table = table
         self.columns = columns
+        self.ifNotExists = ifNotExists
     }
 }
 
@@ -499,7 +511,8 @@ public struct SQLRenderer: Sendable {
         }
 
         let columns = createTable.columns.map(renderColumnDefinition)
-        let sql = "CREATE TABLE \(dialect.quoteIdentifier(createTable.table)) "
+        let head = try dialect.createTableHead(ifNotExists: createTable.ifNotExists)
+        let sql = "\(head) \(dialect.quoteIdentifier(createTable.table)) "
             + "(\(columns.joined(separator: ", ")))"
         return RenderedSQL(sql: sql, parameters: [])
     }

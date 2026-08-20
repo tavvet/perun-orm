@@ -42,7 +42,17 @@ jobs:
           echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
 
       - name: Build
-        run: swift build --explicit-target-dependency-import-check error
+        run: >-
+          swift build
+          --explicit-target-dependency-import-check error
+          -Xswiftc -warnings-as-errors
+
+      - name: Run migration consumer smoke
+        run: >-
+          swift run
+          --package-path .github/consumer-smoke
+          -Xswiftc -warnings-as-errors
+          MigrationConsumerSmoke
 
       - name: Set up PostgreSQL
         shell: bash
@@ -73,7 +83,7 @@ jobs:
           PGDATABASE: perun
           PGPASSWORD: perun
           PGSSLMODE: disable
-        run: swift test
+        run: swift test -Xswiftc -warnings-as-errors
 
       - name: Build documentation
         shell: bash
@@ -86,7 +96,13 @@ jobs:
           test -n "$symbol_graph_root"
           mkdir -p .build/docc-catalogs .build/docc-symbols .build/docc
 
-          for module in PerunDBAL PerunDBALPostgres PerunDBALSQLite PerunORM; do
+          for module in \
+            PerunDBAL \
+            PerunDBALPostgres \
+            PerunDBALSQLite \
+            PerunMigrations \
+            PerunORM
+          do
             module_catalog=".build/docc-catalogs/$module.docc"
             module_symbols=".build/docc-symbols/$module"
             module_archive=".build/docc/$module.doccarchive"
@@ -102,3 +118,87 @@ jobs:
               --output-path "$module_archive" \
               --warnings-as-errors
           done
+
+  validate-linux:
+    name: Build and test on Linux with Swift 6.0.3
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: swift:6.0.3-jammy
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: perun
+          POSTGRES_USER: perun
+          POSTGRES_PASSWORD: perun
+        options: >-
+          --health-cmd "pg_isready --username=perun --dbname=perun"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PERUN_PGSQL_INTEGRATION: "1"
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: perun
+      PGDATABASE: perun
+      PGPASSWORD: perun
+      PGSSLMODE: disable
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Install native dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            libssl-dev \
+            libsqlite3-dev \
+            openssl \
+            pkg-config \
+            postgresql-client
+
+          openssl_version="$(pkg-config --modversion openssl)"
+          test "${openssl_version%%.*}" = "3"
+          pkg-config --modversion sqlite3
+
+      - name: Build
+        run: >-
+          swift build
+          --explicit-target-dependency-import-check error
+          -Xswiftc -warnings-as-errors
+
+      - name: Run migration consumer smoke
+        run: >-
+          swift run
+          --package-path .github/consumer-smoke
+          -Xswiftc -warnings-as-errors
+          MigrationConsumerSmoke
+
+      - name: Verify PostgreSQL connection
+        run: |
+          set -euo pipefail
+
+          pg_isready \
+            --host "$PGHOST" \
+            --port "$PGPORT" \
+            --username "$PGUSER" \
+            --dbname "$PGDATABASE"
+          psql --no-password --command "SELECT 1"
+
+      - name: Test
+        run: swift test -Xswiftc -warnings-as-errors

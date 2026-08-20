@@ -1,17 +1,20 @@
 # PerunORM
 
-PerunORM is a small, async Swift ORM and database abstraction layer for PostgreSQL and SQLite.
-It keeps the SQL core backend-neutral while exposing explicit adapters for both databases.
+PerunORM is a small, async Swift ORM, database abstraction layer, and migration runner for
+PostgreSQL and SQLite. It keeps the SQL core backend-neutral while exposing explicit adapters for
+both databases.
 
-The 0.1 API is intentionally narrow: value-semantic entities, one primary key, typed
-single-table queries, eager CRUD inside a closure-scoped unit of work, and raw SQL escape
-hatches when the typed surface is not enough.
+The 0.2 API adds atomic forward-only migrations while keeping the ORM intentionally narrow:
+value-semantic entities, one primary key, typed single-table queries, eager CRUD inside a
+closure-scoped unit of work, and raw SQL escape hatches when the typed surface is not enough.
 
 ## Requirements
 
 - Swift 6.0 or newer
 - macOS 13 or newer when building on macOS
 - PostgreSQL or SQLite
+- On Debian/Ubuntu Linux, `libssl-dev` for PostgreSQL, `libsqlite3-dev` for SQLite, and
+  `pkg-config`
 
 ## Package products
 
@@ -20,6 +23,7 @@ hatches when the typed surface is not enough.
 | `PerunDBAL` | Backend-neutral values, rows, SQL AST, rendering, and execution protocols |
 | `PerunDBALPostgres` | PostgreSQL database façade and dialect |
 | `PerunDBALSQLite` | SQLite database façade and dialect |
+| `PerunMigrations` | Atomic forward-only migrations, history validation, and status |
 | `PerunORM` | Entity mapping, sessions, typed queries, and unit-of-work CRUD |
 
 ## Installation
@@ -30,18 +34,19 @@ Add PerunORM to `Package.swift`:
 dependencies: [
     .package(
         url: "https://github.com/tavvet/perun-orm.git",
-        from: "0.1.0"
+        from: "0.2.0"
     ),
 ]
 ```
 
-Depend on the neutral DBAL, the ORM, and the adapter used by your target:
+Depend on the neutral DBAL, migrations, the ORM, and the adapter used by your target:
 
 ```swift
 .executableTarget(
     name: "App",
     dependencies: [
         .product(name: "PerunDBAL", package: "perun-orm"),
+        .product(name: "PerunMigrations", package: "perun-orm"),
         .product(name: "PerunORM", package: "perun-orm"),
         .product(name: "PerunDBALSQLite", package: "perun-orm"),
         // Or: .product(name: "PerunDBALPostgres", package: "perun-orm"),
@@ -102,7 +107,7 @@ SQLite:
 ```swift
 import PerunDBALSQLite
 
-let database: any Database = SQLiteDatabase(
+let database: any ExclusiveTransactionDatabase = SQLiteDatabase(
     configuration: .file("perun.sqlite"),
     maxConnections: 1
 )
@@ -116,7 +121,7 @@ PostgreSQL:
 ```swift
 import PerunDBALPostgres
 
-let database: any Database = PostgresDatabase(
+let database: any ExclusiveTransactionDatabase = PostgresDatabase(
     configuration: .init(
         host: "localhost",
         port: 5_432,
@@ -129,23 +134,87 @@ let database: any Database = PostgresDatabase(
 )
 ```
 
-### 3. Create the schema
+### 3. Run migrations
 
-PerunORM 0.1 does not run migrations or create tables automatically. This DDL works for the
-assigned-key `Todo` mapping on both supported databases:
+`Migrator` receives the complete ordered plan on every launch. The first run applies the pending
+suffix in one exclusive transaction; later runs validate the persisted prefix and become no-ops
+until a new migration is appended.
 
 ```swift
-_ = try await database.execute(
-    """
-    CREATE TABLE IF NOT EXISTS "todos" (
-        "id" BIGINT PRIMARY KEY,
-        "title" TEXT NOT NULL,
-        "is_done" BOOLEAN NOT NULL
-    )
-    """,
-    []
-)
+import PerunMigrations
+
+let migrations = [
+    Migration(id: "001_create_todos") { context in
+        let statement = try context.renderer.render(
+            SQLCreateTable(
+                table: Todo.tableName,
+                columns: [
+                    SQLColumnDefinition(
+                        name: "id",
+                        type: .int64,
+                        role: .primaryKey(generated: false)
+                    ),
+                    SQLColumnDefinition(name: "title", type: .text),
+                    SQLColumnDefinition(name: "is_done", type: .boolean),
+                ]
+            )
+        )
+        _ = try await context.execute(statement.sql, statement.parameters)
+    },
+    Migration(id: "002_seed_todos") { context in
+        let statement = try context.renderer.render(
+            SQLInsert(
+                table: Todo.tableName,
+                values: [
+                    SQLColumnValue(column: "id", value: .int(0)),
+                    SQLColumnValue(column: "title", value: .text("Read the migration guide")),
+                    SQLColumnValue(column: "is_done", value: .bool(false)),
+                ]
+            )
+        )
+        _ = try await context.execute(statement.sql, statement.parameters)
+    },
+]
+
+let migrator = try Migrator(database: database, migrations: migrations)
+let before = try await migrator.status() // applied: [], pending: [001, 002]
+let firstReport = try await migrator.migrate() // applied: [001, 002]
+let restartReport = try await migrator.migrate() // applied: []
 ```
+
+For the next release, preserve the complete existing prefix and append a new migration. Only the
+new suffix runs:
+
+```swift
+let nextReleaseMigrations = migrations + [
+    Migration(id: "003_complete_seed_todo") { context in
+        let p1 = context.dialect.placeholder(at: 1)
+        let p2 = context.dialect.placeholder(at: 2)
+        _ = try await context.execute(
+            "UPDATE \"todos\" SET \"is_done\" = \(p1) WHERE \"id\" = \(p2)",
+            [.bool(true), .int(0)]
+        )
+    },
+]
+
+let nextMigrator = try Migrator(database: database, migrations: nextReleaseMigrations)
+let appendReport = try await nextMigrator.migrate() // applied: [003]
+```
+
+Migration identifiers and revisions are persisted API. Never reorder, remove, rename, or edit an
+applied migration; append a new one instead. A history mismatch is reported before any pending body
+starts.
+
+The complete pending suffix and its tracking rows commit or roll back together. Migration bodies
+run sequentially and must finish all work before returning. Do not retain `MigrationContext`, start
+overlapping operations, or issue `BEGIN`, `COMMIT`, `ROLLBACK`, savepoint commands, or SQL batches.
+If an executor error is caught inside a body, the context remains rollback-only and `migrate()`
+still fails. External network, filesystem, sequence, and other nontransactional effects are outside
+the rollback guarantee, so keep bodies retry-safe.
+
+Run migrations before serving application traffic, or in a maintenance window. Ordinary
+application SQL does not participate in the migration lock. If commit acknowledgement is lost,
+call `status()` or `migrate()` again and let tracking history determine whether the batch committed.
 
 ### 4. Insert and update in a unit of work
 
@@ -157,7 +226,7 @@ let session = Session(database: database)
 
 let inserted = try await session.withUnitOfWork { unitOfWork in
     try await unitOfWork.insert(
-        Todo(id: 1, title: "Ship PerunORM 0.1", isDone: false)
+        Todo(id: 1, title: "Ship PerunORM 0.2", isDone: false)
     )
 }
 
@@ -249,7 +318,21 @@ finished:
 await database.shutdown()
 ```
 
-## Important 0.1 semantics
+## Important semantics
+
+### Migrations
+
+- Every run supplies the complete canonical plan. Persisted history must be its exact prefix.
+- The whole pending suffix is one atomic transaction, not one transaction per migration.
+- PostgreSQL uses a database-wide advisory transaction lock. SQLite uses `BEGIN IMMEDIATE` and
+  intentionally serializes all writers more strongly.
+- Different tracking table names do not permit concurrent migration bodies.
+- `MigrationReport.applied` contains only migrations committed by that call. An empty report means
+  the database was already current.
+- `MigrationStatus` is read under the same exclusive transaction used by `migrate()` and never
+  invokes migration bodies.
+
+### Sessions and units of work
 
 - `Session` and `UnitOfWork` are actors.
 - Direct session operations may overlap; identity revisions prevent a late read from restoring
@@ -268,9 +351,10 @@ await database.shutdown()
 
 ## Current scope
 
-PerunORM 0.1 does not yet include relationships, joins, migrations, schema introspection,
-composite primary keys, lazy loading, lifecycle hooks, or model macros. See the
-[0.1 design draft](docs/0.1-design-draft.md) for the complete rationale and deferred scope.
+PerunORM 0.2 does not include relationships, joins, schema introspection, down migrations,
+nontransactional migration steps, composite primary keys, lazy loading, lifecycle hooks, or model
+macros. See the [0.2 design draft](docs/0.2-design-draft.md) for the migration contract and the
+[0.1 design draft](docs/0.1-design-draft.md) for the ORM architecture.
 
 ## Testing
 
@@ -294,3 +378,5 @@ swift test
 ```
 
 The PostgreSQL suite creates and drops its own test tables in the selected database.
+GitHub Actions runs the strict build, consumer smoke, and SQLite/PostgreSQL suite on macOS and
+Linux. DocC remains in the macOS job because the workflow uses Xcode's `docc` executable.

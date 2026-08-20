@@ -672,7 +672,7 @@ public actor UnitOfWork {
         try beginOperation()
         defer { endOperation() }
 
-        if let command = transactionControlCommand(in: sql) {
+        if let command = sqlTransactionControlCommand(in: sql) {
             rollbackOnly = true
             throw SessionError.transactionControlNotAllowed(command: command)
         }
@@ -758,7 +758,7 @@ public actor UnitOfWork {
         try beginOperation()
         defer { endOperation() }
 
-        if let command = transactionControlCommand(in: sql) {
+        if let command = sqlTransactionControlCommand(in: sql) {
             rollbackOnly = true
             throw SessionError.transactionControlNotAllowed(command: command)
         }
@@ -1186,91 +1186,4 @@ private func decodeCount(_ result: ExecResult, table: String) throws -> Int64 {
         )
     }
     return try row.decode(SQLCount.resultColumn, as: Int64.self)
-}
-
-private func transactionControlCommand(in sql: String) -> String? {
-    let keywords = leadingSQLKeywords(in: sql, limit: 2)
-    guard let first = keywords.first else { return nil }
-
-    switch first {
-    case "BEGIN", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE":
-        return first
-    case "START", "PREPARE", "SET":
-        guard keywords.count == 2, keywords[1] == "TRANSACTION" else { return nil }
-        return "\(first) TRANSACTION"
-    default:
-        return nil
-    }
-}
-
-private func leadingSQLKeywords(in sql: String, limit: Int) -> [String] {
-    let bytes = Array(sql.utf8)
-    var index = 0
-    var keywords: [String] = []
-
-    while keywords.count < limit {
-        skipSQLTrivia(bytes, index: &index)
-        let start = index
-        while index < bytes.count, isSQLIdentifierByte(bytes[index]) {
-            index += 1
-        }
-        guard start < index else { break }
-        keywords.append(String(decoding: bytes[start ..< index], as: UTF8.self).uppercased())
-    }
-    return keywords
-}
-
-private func skipSQLTrivia(_ bytes: [UInt8], index: inout Int) {
-    while index < bytes.count {
-        if isSQLWhitespace(bytes[index]) || bytes[index] == UInt8(ascii: ";") {
-            index += 1
-            continue
-        }
-        if index + 1 < bytes.count,
-           bytes[index] == UInt8(ascii: "-"),
-           bytes[index + 1] == UInt8(ascii: "-") {
-            index += 2
-            while index < bytes.count,
-                  bytes[index] != UInt8(ascii: "\n"),
-                  bytes[index] != UInt8(ascii: "\r") {
-                index += 1
-            }
-            continue
-        }
-        if index + 1 < bytes.count,
-           bytes[index] == UInt8(ascii: "/"),
-           bytes[index + 1] == UInt8(ascii: "*") {
-            index += 2
-            var depth = 1
-            while index < bytes.count, depth > 0 {
-                if index + 1 < bytes.count,
-                   bytes[index] == UInt8(ascii: "/"),
-                   bytes[index + 1] == UInt8(ascii: "*") {
-                    depth += 1
-                    index += 2
-                } else if index + 1 < bytes.count,
-                          bytes[index] == UInt8(ascii: "*"),
-                          bytes[index + 1] == UInt8(ascii: "/") {
-                    depth -= 1
-                    index += 2
-                } else {
-                    index += 1
-                }
-            }
-            continue
-        }
-        break
-    }
-}
-
-private func isSQLWhitespace(_ byte: UInt8) -> Bool {
-    byte == UInt8(ascii: " ") || (UInt8(ascii: "\t") ... UInt8(ascii: "\r")).contains(byte)
-}
-
-private func isSQLIdentifierByte(_ byte: UInt8) -> Bool {
-    (UInt8(ascii: "A") ... UInt8(ascii: "Z")).contains(byte)
-        || (UInt8(ascii: "a") ... UInt8(ascii: "z")).contains(byte)
-        || (UInt8(ascii: "0") ... UInt8(ascii: "9")).contains(byte)
-        || byte == UInt8(ascii: "_")
-        || byte == UInt8(ascii: "$")
 }

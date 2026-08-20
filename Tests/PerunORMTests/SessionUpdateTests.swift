@@ -1,8 +1,8 @@
+import Foundation
 import PerunDBAL
 import PerunDBALPostgres
 import PerunDBALSQLite
 @testable import PerunORM
-import os
 import Testing
 
 @Test
@@ -798,19 +798,24 @@ private struct FloatingUpdateRecord: Entity {
     }
 }
 
-private final class MutableUpdateName: Sendable {
-    private let storage: OSAllocatedUnfairLock<String>
+private final class MutableUpdateName: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: String
 
     init(_ value: String) {
-        storage = OSAllocatedUnfairLock(initialState: value)
+        storedValue = value
     }
 
     var value: String {
-        storage.withLock { $0 }
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
     }
 
     func set(_ value: String) {
-        storage.withLock { $0 = value }
+        lock.lock()
+        defer { lock.unlock() }
+        storedValue = value
     }
 }
 

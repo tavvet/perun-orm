@@ -14,8 +14,16 @@ public enum PostgresAdapterError: Error, Sendable, Equatable {
     case unsupportedResultFormat(column: String, formatCode: Int16)
 }
 
+/// Failures found while validating caller-supplied PostgreSQL statements before execution.
+public struct PostgresStatementError: Error, Sendable, Equatable {
+    /// The SQL contains only whitespace, semicolons, UTF-8 byte-order marks, or comments.
+    public static let emptyStatement = PostgresStatementError()
+
+    private init() {}
+}
+
 /// DBAL façade over the standalone PostgreSQL connection pool.
-public struct PostgresDatabase: Database {
+public struct PostgresDatabase: ExclusiveTransactionDatabase {
     private let client: PostgresClient
 
     /// The rendering policy paired with this database executor.
@@ -55,6 +63,9 @@ public struct PostgresDatabase: Database {
         _ parameters: [SQLValue],
         intent: ExecutionIntent
     ) async throws -> ExecResult {
+        guard sqlContainsMeaningfulStatement(in: sql) else {
+            throw PostgresStatementError.emptyStatement
+        }
         let result = try await client.query(
             sql,
             try postgresParameters(parameters),
@@ -73,6 +84,40 @@ public struct PostgresDatabase: Database {
         }
     }
 
+    /// Executes `body` at `READ COMMITTED` after acquiring a transaction-scoped PostgreSQL
+    /// advisory lock.
+    public func withExclusiveTransaction<T: Sendable>(
+        lockKey: DatabaseLockKey,
+        _ body: @Sendable (any Transaction) async throws -> T
+    ) async throws -> T {
+        try await client.withTransaction { transaction in
+            let dbalTransaction = PostgresTransaction(base: transaction)
+            // The advisory-lock SELECT is the first snapshot-taking statement. Force
+            // READ COMMITTED before it so a waiter sees the previous holder's commit after
+            // acquiring the lock even when the session default is REPEATABLE READ or SERIALIZABLE.
+            _ = try await dbalTransaction.execute(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                [],
+                intent: .arbitrary
+            )
+            _ = try await dbalTransaction.execute(
+                "SELECT pg_advisory_xact_lock($1::bigint)",
+                [.int(lockKey.rawValue)],
+                intent: .arbitrary
+            )
+            let result = try await body(dbalTransaction)
+            // PostgreSQL keeps a transaction aborted after a server statement error even if the
+            // body catches that error. Probe before COMMIT so the driver rolls back and reports
+            // the failed transaction instead of accepting PostgreSQL's ROLLBACK command tag.
+            _ = try await dbalTransaction.execute(
+                "SELECT 1",
+                [],
+                intent: .arbitrary
+            )
+            return result
+        }
+    }
+
     /// Shuts down the underlying client. Repeated calls are safe.
     public func shutdown() async {
         await client.shutdown()
@@ -87,6 +132,9 @@ private struct PostgresTransaction: Transaction {
         _ parameters: [SQLValue],
         intent: ExecutionIntent
     ) async throws -> ExecResult {
+        guard sqlContainsMeaningfulStatement(in: sql) else {
+            throw PostgresStatementError.emptyStatement
+        }
         let result = try await base.query(
             sql,
             try postgresParameters(parameters),

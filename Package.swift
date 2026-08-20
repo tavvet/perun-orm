@@ -10,6 +10,7 @@ let package = Package(
         .library(name: "PerunDBAL", targets: ["PerunDBAL"]),
         .library(name: "PerunDBALPostgres", targets: ["PerunDBALPostgres"]),
         .library(name: "PerunDBALSQLite", targets: ["PerunDBALSQLite"]),
+        .library(name: "PerunMigrations", targets: ["PerunMigrations"]),
         .library(name: "PerunORM", targets: ["PerunORM"]),
     ],
     dependencies: [
@@ -39,6 +40,10 @@ let package = Package(
             ]
         ),
         .target(
+            name: "PerunMigrations",
+            dependencies: ["PerunDBAL"]
+        ),
+        .target(
             name: "PerunORM",
             dependencies: ["PerunDBAL"]
         ),
@@ -48,6 +53,17 @@ let package = Package(
                 "PerunDBAL",
                 "PerunDBALPostgres",
                 "PerunDBALSQLite",
+                .product(name: "PerunPGSQL", package: "perun-pgsql"),
+                .product(name: "PerunSQLite", package: "perun-sqlite"),
+            ]
+        ),
+        .testTarget(
+            name: "PerunMigrationsTests",
+            dependencies: [
+                "PerunDBAL",
+                "PerunDBALPostgres",
+                "PerunDBALSQLite",
+                "PerunMigrations",
                 .product(name: "PerunPGSQL", package: "perun-pgsql"),
                 .product(name: "PerunSQLite", package: "perun-sqlite"),
             ]
