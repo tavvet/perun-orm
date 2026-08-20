@@ -13,6 +13,8 @@ closure-scoped unit of work, and raw SQL escape hatches when the typed surface i
 - Swift 6.0 or newer
 - macOS 13 or newer when building on macOS
 - PostgreSQL or SQLite
+- On Debian/Ubuntu Linux, `libssl-dev` for PostgreSQL, `libsqlite3-dev` for SQLite, and
+  `pkg-config`
 
 ## Package products
 
@@ -376,3 +378,5 @@ swift test
 ```
 
 The PostgreSQL suite creates and drops its own test tables in the selected database.
+GitHub Actions runs the strict build, consumer smoke, and SQLite/PostgreSQL suite on macOS and
+Linux. DocC remains in the macOS job because the workflow uses Xcode's `docc` executable.
